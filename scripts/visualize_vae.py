@@ -19,8 +19,8 @@ from src.models.vae import VAE
 from src.preprocessing.geometry_utils import vec_to_sym_matrix
 
 # --- CONFIG ---
-CHECKPOINT_PATH = "checkpoints/vae/vae_encoder_best.pth"  # Use best model
-LATENT_DIM = 8  # Match your training config
+CHECKPOINT_PATH = "checkpoints/vae/vae_latent128_best.pth"  # Use best model
+LATENT_DIM = 128 # Match your training config
 INPUT_DIM = 325
 N_CHANNELS = 25  # Calculated from 325 -> 25*26/2 = 325
 
@@ -41,17 +41,31 @@ def visualize_reconstruction():
     model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device))
     model.eval()
     
-    # 3. Get a random sample
+    # 3. Load Normalization Stats
+    stats_path = f"checkpoints/vae/vae_norm_stats_latent{LATENT_DIM}.npy"
+    print(f"Loading normalization stats from {stats_path}...")
+    norm_stats = np.load(stats_path, allow_pickle=True).item()
+    mean = torch.tensor(norm_stats['mean']).to(device)
+    std = torch.tensor(norm_stats['std']).to(device)
+
+    # 4. Get a random sample
     # Dataloader returns sequences (Batch, Seq_Len, Feat). Take first frame.
     seq_vectors, _ = next(iter(dl)) 
     original_vec = seq_vectors[0, 0, :].to(device)  # First frame of sequence
     
-    # 4. Pass through VAE
+    # 5. Pass through VAE
     print("Generating reconstruction...")
     with torch.no_grad():
-        recon_vec, mu, _ = model(original_vec.unsqueeze(0))  # Add batch dim
+        # Normalize input
+        norm_vec = (original_vec - mean) / std
         
-    # 5. Reconstruct Matrices (Vector -> Symmetric Tangent Matrix)
+        # Forward pass
+        recon_norm, mu, _ = model(norm_vec.unsqueeze(0))  # Add batch dim
+        
+        # Denormalize output
+        recon_vec = (recon_norm * std) + mean
+        
+    # 6. Reconstruct Matrices (Vector -> Symmetric Tangent Matrix)
     # Note: We're visualizing Tangent Space (Log-Euclidean), not SPD, 
     # but the structure is similar.
     orig_matrix = vec_to_sym_matrix(original_vec, N_CHANNELS).cpu().numpy()

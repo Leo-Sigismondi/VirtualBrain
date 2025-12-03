@@ -42,7 +42,7 @@ def log_euclidean_map(spd_matrix):
     eigvals, eigvecs = torch.linalg.eigh(spd_matrix)
     
     # Logaritmo degli autovalori (aggiungiamo epsilon per sicurezza numerica)
-    log_eigvals = torch.log(torch.clamp(eigvals, min=1e-6))
+    log_eigvals = torch.log(torch.clamp(eigvals, min=1e-20))
     
     # Ricostruzione: U * diag(log_s) * U.T
     # Usiamo matmul per gestire i batch correttamente

@@ -16,6 +16,7 @@ ENV/
 # Data (large files)
 data/raw/
 data/processed/
+data/
 
 # Model checkpoints
 checkpoints/
@@ -37,3 +38,4 @@ Thumbs.db
 # Logs
 *.log
 wandb/
+
