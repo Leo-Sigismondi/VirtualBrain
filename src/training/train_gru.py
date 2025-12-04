@@ -25,18 +25,18 @@ from tqdm import tqdm
 BATCH_SIZE = 64
 EPOCHS = 100
 LEARNING_RATE = 1e-3
-LATENT_DIM = 128
+LATENT_DIM = 32
 HIDDEN_DIM = 128
-NUM_LAYERS = 2
-DROPOUT = 0.1
+NUM_LAYERS = 1
+DROPOUT = 0.2
 INPUT_DIM = 325
 SKIP_STEPS = 4  # Predict 4 steps ahead (1 second) to force learning dynamics
-LAZY_PENALTY_WEIGHT = 0.05 # Penalize small prediction vectors to prevent lazy prediction
+LAZY_PENALTY_WEIGHT = 0.1 # Penalize small prediction vectors to prevent lazy prediction
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-VAE_PATH = "checkpoints/vae/vae_latent128_best.pth"
-SAVE_PATH = "checkpoints/gru/gru_L128_H128_Lay2.pth"
-BEST_MODEL_PATH = "checkpoints/gru/gru_L128_H128_Lay2_best.pth"
+VAE_PATH = "checkpoints/vae/vae_latent32_best.pth"
+SAVE_PATH = "checkpoints/gru/gru_L32_H128_Lay1.pth"
+BEST_MODEL_PATH = "checkpoints/gru/gru_L32_H128_Lay1_best.pth"
 
 def encode_to_latent(vae_model, dataloader, device, norm_stats=None):
     """
@@ -269,9 +269,10 @@ def train_gru(config=None):
     ).to(device)
     
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=10
-    )
+    # scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    #     optimizer, mode='min', factor=0.5, patience=10
+    # )
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr/10)
     
     # 8. Training loop
     best_val_loss = float('inf')

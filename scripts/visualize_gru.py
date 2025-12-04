@@ -13,6 +13,7 @@ if str(project_root) not in sys.path:
 import os
 import sys
 import torch
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import numpy as np
 from src.data.dataset import BCIDataset
@@ -25,12 +26,13 @@ sys.stdout.reconfigure(encoding='utf-8')
 
 
 # --- CONFIG ---
-VAE_PATH = "checkpoints/vae/vae_latent128_best.pth"
-GRU_PATH = "checkpoints/gru/gru_L128_H128_Lay2_best.pth"
-LATENT_DIM = 128
+VAE_PATH = "checkpoints/vae/vae_latent16_best.pth"
+GRU_PATH = "checkpoints/gru/gru_L16_H128_Lay1_best.pth"
+LATENT_DIM = 16
 HIDDEN_DIM = 128
 INPUT_DIM = 325
-NUM_LAYERS = 2
+NUM_LAYERS = 1
+SKIP_STEPS = 4  # Match training config
 
 def visualize_predictions():
     """
@@ -104,7 +106,7 @@ def visualize_predictions():
         latent_seq_norm = (latent_seq - latent_mean) / (latent_std + 1e-8)
         
         # Use first 4 timesteps to predict the rest
-        input_seq = latent_seq_norm[:, :-1, :]  # (1, 4, 16)
+        input_seq = latent_seq_norm[:, :-SKIP_STEPS, :]  # (1, 4, 16)
         
         # Predict deltas
         delta_pred, _ = gru(input_seq)
@@ -154,7 +156,7 @@ def visualize_predictions():
     # Plot 1: All latent dimensions over time
     ax = axes[0, 0]
     timesteps_gt = np.arange(seq_len)
-    timesteps_pred = np.arange(1, seq_len)  # Predictions start at t=1
+    timesteps_pred = np.arange(SKIP_STEPS, seq_len)  # Predictions start at t=SKIP_STEPS
     
     for dim in range(LATENT_DIM):
         ax.plot(timesteps_gt, ground_truth[:, dim], 
@@ -184,8 +186,10 @@ def visualize_predictions():
     
     # Plot 3: Prediction error per dimension
     ax = axes[1, 0]
-    # Calculate error for timesteps 1-4 (where we have predictions)
-    errors = np.abs(ground_truth[1:, :] - predictions)
+    # Calculate error for timesteps where we have predictions
+    # ground_truth starts at t=0. predictions start at t=SKIP_STEPS.
+    # So we compare ground_truth[SKIP_STEPS:] with predictions
+    errors = np.abs(ground_truth[SKIP_STEPS:, :] - predictions)
     mean_errors = errors.mean(axis=0)
     
     ax.bar(range(LATENT_DIM), mean_errors, color='coral', alpha=0.7)
@@ -334,8 +338,154 @@ def visualize_multi_step():
     print("\n✓ Multi-step visualization saved")
     plt.show()
 
+def check_naive_baseline(latent_sequences, device, skip_steps=1):
+    """
+    Calculate error if we simply predicted: "The future is the same as the present".
+    Z_{t+skip} = Z_t
+    """
+    print(f"\n--- Naive Baseline Calculation (Skip={skip_steps}) ---")
+    
+    # Input: Current state (all except last skip_steps)
+    current_state = latent_sequences[:, :-skip_steps, :].to(device)
+    
+    # Target: Future state (all starting from skip_steps)
+    future_real = latent_sequences[:, skip_steps:, :].to(device)
+    
+    # Naive Prediction: Copy current state
+    naive_pred = current_state
+    
+    # Calculate MSE
+    mse = F.mse_loss(naive_pred, future_real)
+    print(f"Naive Baseline MSE: {mse.item():.6f}")
+    return mse.item()
+
+def evaluate_model_vs_baseline():
+    """
+    Compare GRU model performance against Naive Baseline
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print("="*60)
+    print("Model vs Baseline Comparison")
+    print("="*60)
+    
+    # 1. Load VAE
+    print(f"Loading VAE from {VAE_PATH}...")
+    vae = VAE(input_dim=INPUT_DIM, latent_dim=LATENT_DIM).to(device)
+    vae.load_state_dict(torch.load(VAE_PATH, map_location=device))
+    vae.eval()
+    
+    # 2. Load GRU
+    print(f"Loading GRU from {GRU_PATH}...")
+    gru = TemporalGRU(
+        latent_dim=LATENT_DIM,
+        hidden_dim=HIDDEN_DIM,
+        num_layers=NUM_LAYERS
+    ).to(device)
+    gru.load_state_dict(torch.load(GRU_PATH, map_location=device))
+    gru.eval()
+    
+    # 3. Load Data
+    print("Loading dataset...")
+    dataset = BCIDataset("data/processed/train")
+    dataloader = DataLoader(dataset, batch_size=64, shuffle=False)
+    
+    # 4. Encode to Latent Space
+    print("Encoding data to latent space...")
+    
+    # Load stats
+    stats_path = f"checkpoints/vae/vae_norm_stats_latent{LATENT_DIM}.npy"
+    if not os.path.exists(stats_path):
+        # Fallback to generic name if specific not found
+        stats_path = "checkpoints/vae/vae_norm_stats.npy"
+        
+    print(f"Loading normalization stats from {stats_path}")
+    vae_norm_stats = np.load(stats_path, allow_pickle=True).item()
+    vae_mean = torch.tensor(vae_norm_stats['mean']).to(device)
+    vae_std = torch.tensor(vae_norm_stats['std']).to(device)
+    
+    all_latents = []
+    with torch.no_grad():
+        for batch_seq, _ in dataloader:
+            batch_seq = batch_seq.to(device)
+            batch_size, seq_len, feat_dim = batch_seq.shape
+            
+            # Flatten
+            x = batch_seq.view(-1, feat_dim)
+            
+            # Normalize
+            x = (x - vae_mean) / vae_std
+            
+            # Encode
+            mu, _ = vae.encode(x)
+            
+            # Reshape
+            latent_seq = mu.view(batch_size, seq_len, -1)
+            all_latents.append(latent_seq)
+            
+    latent_sequences = torch.cat(all_latents, dim=0)
+    
+    # 5. Normalize Latent Space (Same as training)
+    latent_mean = latent_sequences.mean()
+    latent_std = latent_sequences.std()
+    latent_normalized = (latent_sequences - latent_mean) / (latent_std + 1e-8)
+    
+    print(f"Latent Data Shape: {latent_normalized.shape}")
+    
+    # 6. Calculate Baseline
+    # Assuming SKIP_STEPS=4 based on training config, but let's check what the user wants.
+    # The user's snippet had skip_steps=1 default. 
+    # We should use the SKIP_STEPS constant if defined, or default to 4.
+    skip = 4 # Default to 4 as per our training
+    baseline_mse = check_naive_baseline(latent_normalized, device, skip_steps=skip)
+    
+    # 7. Calculate GRU MSE
+    print(f"\n--- Calculating GRU MSE (Skip={skip}) ---")
+    inputs = latent_normalized[:, :-skip, :]
+    targets = latent_normalized[:, skip:, :]
+    
+    # Process in batches to avoid OOM
+    total_mse = 0
+    count = 0
+    batch_size = 64
+    
+    with torch.no_grad():
+        for i in range(0, inputs.shape[0], batch_size):
+            batch_input = inputs[i:i+batch_size].to(device)
+            batch_target = targets[i:i+batch_size].to(device)
+            
+            delta_pred, _ = gru(batch_input)
+            
+            # GRU predicts delta, so predicted_next = current + delta
+            # But we are comparing against target (which is next state)
+            # Wait, train_gru calculates MSE on DELTA.
+            # target_delta = batch_target - batch_input
+            # loss = F.mse_loss(delta_pred, target_delta)
+            
+            # Let's calculate MSE on the actual state reconstruction to be comparable to baseline
+            # Pred State = Input + Delta
+            pred_state = batch_input + delta_pred
+            
+            mse = F.mse_loss(pred_state, batch_target, reduction='sum')
+            total_mse += mse.item()
+            count += batch_input.numel()
+            
+    gru_mse = total_mse / count
+    print(f"GRU Model MSE: {gru_mse:.6f}")
+    
+    # 8. Conclusion
+    print("\n" + "-"*30)
+    print("RESULTS")
+    print("-" * 30)
+    print(f"Baseline MSE: {baseline_mse:.6f}")
+    print(f"GRU Model MSE: {gru_mse:.6f}")
+    
+    if gru_mse < baseline_mse:
+        improvement = (baseline_mse - gru_mse) / baseline_mse * 100
+        print(f"✅ SUCCESS: GRU beats baseline by {improvement:.2f}%")
+    else:
+        print("❌ FAILURE: GRU is worse or equal to baseline (Lazy Predictor)")
+
 if __name__ == "__main__":
     visualize_predictions()
-    
-    # Uncomment to test multi-step prediction
     visualize_multi_step()
+    evaluate_model_vs_baseline()

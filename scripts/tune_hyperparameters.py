@@ -20,7 +20,7 @@ def main():
     print("="*60)
     
     # Search Space
-    LATENT_DIMS = [32, 64, 128]
+    LATENT_DIMS = [16, 32]
     HIDDEN_DIMS = [32, 64, 128]
     NUM_LAYERS = [1, 2]
     
@@ -33,7 +33,7 @@ def main():
         # Train VAE
         vae_config = {
             'latent_dim': latent_dim,
-            'epochs': 100,  # Reduced for speed during tuning
+            'epochs': 500,  # Reduced for speed during tuning
             'batch_size': 64,
             'lr': 1e-3
         }
@@ -48,7 +48,7 @@ def main():
                     'latent_dim': latent_dim,
                     'hidden_dim': hidden_dim,
                     'num_layers': layers,
-                    'epochs': 50,  # Reduced for speed
+                    'epochs': 200,  # Reduced for speed
                     'vae_path': vae_path,
                     'stats_path': stats_path,
                     'lr': 1e-3
