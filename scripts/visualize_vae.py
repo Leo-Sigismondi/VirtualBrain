@@ -19,8 +19,8 @@ from src.models.vae import VAE
 from src.preprocessing.geometry_utils import vec_to_sym_matrix
 
 # --- CONFIG ---
-CHECKPOINT_PATH = "checkpoints/vae/vae_latent128_best.pth"  # Use best model
-LATENT_DIM = 128 # Match your training config
+CHECKPOINT_PATH = "checkpoints/vae/vae_latent32_best.pth"  # Use best model
+LATENT_DIM = 32 # Match your training config
 INPUT_DIM = 325
 N_CHANNELS = 25  # Calculated from 325 -> 25*26/2 = 325
 

@@ -1,6 +1,6 @@
 """
-GRU Temporal Prediction Visualization
-Shows how well the GRU predicts future brain states in latent space
+Autoregressive GRU Visualization Script
+Visualizes how well the GRU predicts future brain states using autoregressive rollouts
 """
 import sys
 from pathlib import Path
@@ -11,7 +11,6 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 import os
-import sys
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
@@ -24,224 +23,25 @@ from src.models.gru import TemporalGRU
 # Force unbuffered output
 sys.stdout.reconfigure(encoding='utf-8')
 
-
 # --- CONFIG ---
-VAE_PATH = "checkpoints/vae/vae_latent16_best.pth"
-GRU_PATH = "checkpoints/gru/gru_L16_H128_Lay1_best.pth"
-LATENT_DIM = 16
-HIDDEN_DIM = 128
+VAE_PATH = "checkpoints/vae/vae_latent32_best.pth"
+GRU_PATH = "checkpoints/gru/gru_autoregressive_L32_H64_4L_best.pth"
+LATENT_DIM = 32
+HIDDEN_DIM = 64
 INPUT_DIM = 325
-NUM_LAYERS = 1
-SKIP_STEPS = 4  # Match training config
+NUM_LAYERS = 4
 
-def visualize_predictions():
-    """
-    Visualize GRU predictions vs ground truth
-    """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+def load_models(device):
+    """Load VAE and GRU models"""
+    print("Loading models...")
     
-    print("="*60)
-    print("GRU Temporal Prediction Visualization")
-    print("="*60)
-    
-    # 1. Load models
-    print(f"\nLoading models...")
+    # Load VAE
     vae = VAE(input_dim=INPUT_DIM, latent_dim=LATENT_DIM).to(device)
     vae.load_state_dict(torch.load(VAE_PATH, map_location=device))
     vae.eval()
     
-    gru = TemporalGRU(
-        latent_dim=LATENT_DIM,
-        hidden_dim=HIDDEN_DIM,
-        num_layers=NUM_LAYERS
-    ).to(device)
-    gru.load_state_dict(torch.load(GRU_PATH, map_location=device))
-    gru.eval()
-    print("✓ Models loaded")
-    
-    # 2. Load data
-    print("\nLoading dataset...")
-    dataset = BCIDataset("data/processed/train")
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
-    
-    # 3. Get a random sequence
-    seq_vectors, _ = next(iter(dataloader))
-    seq_vectors = seq_vectors[0].to(device)  # (Seq_Len=5, Features=325)
-    
-    # Load VAE normalization stats
-    vae_norm_stats = np.load("checkpoints/vae/vae_norm_stats_latent128.npy", allow_pickle=True).item()
-    vae_mean = torch.tensor(vae_norm_stats['mean']).to(device)
-    vae_std = torch.tensor(vae_norm_stats['std']).to(device)
-
-    # 4. Encode to latent space
-    print("Encoding to latent space...")
-    with torch.no_grad():
-        latent_seq = []
-        for t in range(seq_vectors.shape[0]):
-            frame = seq_vectors[t:t+1]  # (1, 325)
-            
-            # Normalize input
-            frame = (frame - vae_mean) / vae_std
-            
-            mu, _ = vae.encode(frame)
-            latent_seq.append(mu)
-        latent_seq = torch.cat(latent_seq, dim=0).unsqueeze(0)  # (1, 5, 16)
-    
-    # Load normalization stats
-    stats_path = "checkpoints/gru/latent_norm_stats.npy"
-    if os.path.exists(stats_path):
-        print(f"Loading normalization stats from {stats_path}")
-        stats = np.load(stats_path, allow_pickle=True).item()
-        latent_mean = torch.tensor(stats['mean']).to(device)
-        latent_std = torch.tensor(stats['std']).to(device)
-    else:
-        print("WARNING: No normalization stats found! Predictions may be poor.")
-        latent_mean = torch.tensor(0.0).to(device)
-        latent_std = torch.tensor(1.0).to(device)
-
-    # 5. Make predictions
-    print("Generating predictions...")
-    with torch.no_grad():
-        # Normalize latent sequence for the GRU
-        latent_seq_norm = (latent_seq - latent_mean) / (latent_std + 1e-8)
-        
-        # Use first 4 timesteps to predict the rest
-        input_seq = latent_seq_norm[:, :-SKIP_STEPS, :]  # (1, 4, 16)
-        
-        # Predict deltas
-        delta_pred, _ = gru(input_seq)
-        
-        # Apply residual connection to get predictions (in normalized space)
-        predicted_states_norm = input_seq + delta_pred  # (1, 4, 16)
-        
-        # Let's visualize in NORMALIZED space
-        predicted_states = predicted_states_norm
-        
-        # Also update ground truth to be normalized for comparison
-        ground_truth_tensor = latent_seq_norm
-    
-    # Convert to numpy
-    ground_truth = ground_truth_tensor[0].cpu().numpy()  # (Seq_Len, 16)
-    predictions = predicted_states[0].cpu().numpy()  # (Seq_Len-1, 16)
-    
-    # Analyze Ground Truth Dynamics
-    gt_std = np.std(ground_truth, axis=0)
-    gt_range = np.ptp(ground_truth, axis=0)  # Peak-to-peak (max - min)
-    
-    with open("variance_analysis.txt", "w", encoding="utf-8") as f:
-        f.write("Ground Truth Dynamics Analysis:\n")
-        f.write(f"  Avg Std across dims: {np.mean(gt_std):.6f}\n")
-        f.write(f"  Max Std in any dim: {np.max(gt_std):.6f}\n")
-        f.write(f"  Avg Range (max-min): {np.mean(gt_range):.6f}\n")
-        f.write(f"  Max Range in any dim: {np.max(gt_range):.6f}\n")
-        
-        if np.max(gt_range) < 0.1:
-            f.write("\nWARNING: Ground truth is extremely flat!\n")
-            f.write("   The VAE might be collapsing the temporal dimension.\n")
-            f.write("   This explains why the lines look straight.\n")
-
-            
-    print("Analysis written to variance_analysis.txt")
-
-
-    predictions = predicted_states[0].cpu().numpy()  # (Seq_Len-1, 16)
-    
-    # Get sequence length automatically
-    seq_len = ground_truth.shape[0]
-    pred_len = predictions.shape[0]
-    
-    # 6. Visualize
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    
-    # Plot 1: All latent dimensions over time
-    ax = axes[0, 0]
-    timesteps_gt = np.arange(seq_len)
-    timesteps_pred = np.arange(SKIP_STEPS, seq_len)  # Predictions start at t=SKIP_STEPS
-    
-    for dim in range(LATENT_DIM):
-        ax.plot(timesteps_gt, ground_truth[:, dim], 
-                'o-', alpha=0.3, color='gray', markersize=4)
-        ax.plot(timesteps_pred, predictions[:, dim], 
-                'x--', alpha=0.8, markersize=6)
-    
-    ax.set_xlabel('Timestep')
-    ax.set_ylabel('Latent Value')
-    ax.set_title('All Latent Dimensions\n(Gray=Ground Truth, Colored=Predictions)')
-    ax.grid(True, alpha=0.3)
-    ax.legend(['Ground Truth', 'Predictions'], loc='upper right')
-    
-    # Plot 2: First 4 latent dimensions (zoomed)
-    ax = axes[0, 1]
-    for dim in range(min(4, LATENT_DIM)):
-        ax.plot(timesteps_gt, ground_truth[:, dim], 
-                'o-', label=f'GT Dim {dim}', markersize=6)
-        ax.plot(timesteps_pred, predictions[:, dim], 
-                'x--', label=f'Pred Dim {dim}', markersize=8)
-    
-    ax.set_xlabel('Timestep')
-    ax.set_ylabel('Latent Value')
-    ax.set_title('First 4 Latent Dimensions (Zoomed)')
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-    
-    # Plot 3: Prediction error per dimension
-    ax = axes[1, 0]
-    # Calculate error for timesteps where we have predictions
-    # ground_truth starts at t=0. predictions start at t=SKIP_STEPS.
-    # So we compare ground_truth[SKIP_STEPS:] with predictions
-    errors = np.abs(ground_truth[SKIP_STEPS:, :] - predictions)
-    mean_errors = errors.mean(axis=0)
-    
-    ax.bar(range(LATENT_DIM), mean_errors, color='coral', alpha=0.7)
-    ax.set_xlabel('Latent Dimension')
-    ax.set_ylabel('Mean Absolute Error')
-    ax.set_title(f'Prediction Error per Dimension\n(Overall MAE: {mean_errors.mean():.6f})')
-    ax.grid(True, alpha=0.3, axis='y')
-    
-    # Plot 4: Error over time
-    ax = axes[1, 1]
-    errors_per_timestep = errors.mean(axis=1)
-    ax.plot(timesteps_pred, errors_per_timestep, 'o-', 
-            color='red', markersize=8, linewidth=2)
-    ax.set_xlabel('Timestep')
-    ax.set_ylabel('Mean Absolute Error')
-    ax.set_title('Prediction Error Over Time')
-    ax.grid(True, alpha=0.3)
-    
-    plt.suptitle(f'GRU Temporal Prediction Quality (Latent Dim={LATENT_DIM}, Hidden Dim={HIDDEN_DIM})',
-                 fontsize=14, fontweight='bold', y=0.995)
-    plt.tight_layout()
-    
-    # Save
-    output_path = f"checkpoints/gru/prediction_visualization.png"
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    print(f"\n✓ Visualization saved to: {output_path}")
-    
-    # Print statistics
-    print(f"\nPrediction Quality:")
-    print(f"  Overall MAE: {mean_errors.mean():.6f}")
-    print(f"  Max Error (worst dim): {mean_errors.max():.6f}")
-    print(f"  Min Error (best dim): {mean_errors.min():.6f}")
-    print(f"  Error at t=1: {errors_per_timestep[0]:.6f}")
-    print(f"  Error at t=4: {errors_per_timestep[-1]:.6f}")
-    
-    plt.show()
-
-def visualize_multi_step():
-    """
-    Test multi-step autoregressive prediction
-    """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    print("\n" + "="*60)
-    print("Multi-Step Autoregressive Prediction")
-    print("="*60)
-    
-    # Load models
-    vae = VAE(input_dim=INPUT_DIM, latent_dim=LATENT_DIM).to(device)
-    vae.load_state_dict(torch.load(VAE_PATH, map_location=device))
-    vae.eval()
-    
+    # Load GRU
     gru = TemporalGRU(
         latent_dim=LATENT_DIM,
         hidden_dim=HIDDEN_DIM,
@@ -250,159 +50,352 @@ def visualize_multi_step():
     gru.load_state_dict(torch.load(GRU_PATH, map_location=device))
     gru.eval()
     
-    # Load data
-    dataset = BCIDataset("data/processed/train")
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
-    seq_vectors, _ = next(iter(dataloader))
-    seq_vectors = seq_vectors[0].to(device)
-    
-    # Load VAE normalization stats
-    vae_norm_stats = np.load("checkpoints/vae/vae_norm_stats_latent128.npy", allow_pickle=True).item()
-    vae_mean = torch.tensor(vae_norm_stats['mean']).to(device)
-    vae_std = torch.tensor(vae_norm_stats['std']).to(device)
+    print("✓ Models loaded\n")
+    return vae, gru
 
-    # Encode
+
+def encode_sequence(vae, seq_vectors, vae_mean, vae_std, device):
+    """Encode a sequence to latent space"""
+    latent_seq = []
     with torch.no_grad():
-        latent_seq = []
         for t in range(seq_vectors.shape[0]):
             frame = seq_vectors[t:t+1]
             
             # Normalize input
             frame = (frame - vae_mean) / vae_std
             
+            # Encode
             mu, _ = vae.encode(frame)
             latent_seq.append(mu)
-        latent_seq = torch.cat(latent_seq, dim=0).unsqueeze(0)  # (1, Seq_Len, 16)
+        
+        latent_seq = torch.cat(latent_seq, dim=0).unsqueeze(0)
+    
+    return latent_seq
+
+
+def visualize_one_step_predictions():
+    """
+    Visualize one-step-ahead predictions
+    Shows how well the model predicts the immediate next state
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    print("="*60)
+    print("One-Step-Ahead Prediction Visualization")
+    print("="*60 + "\n")
+    
+    # Load models
+    vae, gru = load_models(device)
+    
+    # Load data
+    print("Loading dataset...")
+    dataset = BCIDataset("data/processed/train")
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
+    seq_vectors, _ = next(iter(dataloader))
+    seq_vectors = seq_vectors[0].to(device)
+    print(f"✓ Sequence loaded: {seq_vectors.shape}\n")
     
     # Load normalization stats
-    stats_path = "checkpoints/gru/latent_norm_stats.npy"
-    if os.path.exists(stats_path):
-        stats = np.load(stats_path, allow_pickle=True).item()
-        latent_mean = torch.tensor(stats['mean']).to(device)
-        latent_std = torch.tensor(stats['std']).to(device)
-    else:
-        latent_mean = torch.tensor(0.0).to(device)
-        latent_std = torch.tensor(1.0).to(device)
-
-    seq_len = latent_seq.shape[1]
-    num_pred_steps = seq_len - 2  # Use first 2, predict the rest
+    vae_norm_stats = np.load("checkpoints/vae/vae_norm_stats_latent32.npy", allow_pickle=True).item()
+    vae_mean = torch.tensor(vae_norm_stats['mean']).to(device)
+    vae_std = torch.tensor(vae_norm_stats['std']).to(device)
     
-    # Use first 2 timesteps and predict the rest
+    latent_stats = np.load("checkpoints/gru/latent_norm_stats_autoregressive.npy", allow_pickle=True).item()
+    latent_mean = torch.tensor(latent_stats['mean']).to(device)
+    latent_std = torch.tensor(latent_stats['std']).to(device)
+    
+    # Encode sequence
+    print("Encoding to latent space...")
+    latent_seq = encode_sequence(vae, seq_vectors, vae_mean, vae_std, device)
+    
+    # Normalize latent sequence
+    latent_seq_norm = (latent_seq - latent_mean) / (latent_std + 1e-8)
+    
+    seq_len = latent_seq_norm.shape[1]
+    print(f"✓ Encoded: {latent_seq_norm.shape}\n")
+    
+    # One-step predictions
+    print("Generating one-step predictions...")
     with torch.no_grad():
-        # Normalize latent sequence
-        latent_seq_norm = (latent_seq - latent_mean) / (latent_std + 1e-8)
-        
-        z_start = latent_seq_norm[:, :2, :]  # First 2 timesteps
-        
-        # Autoregressive prediction
-        predictions = [z_start[:, 0, :].unsqueeze(1), 
-                      z_start[:, 1, :].unsqueeze(1)]
+        predictions = []
         hidden = None
         
-        for step in range(num_pred_steps):  # Predict remaining steps
-            # Take last predicted state
-            z_current = predictions[-1]
-            
-            # Predict delta
-            delta, hidden = gru(z_current, hidden)
-            
-            # Apply residual
-            z_next = z_current + delta
-            predictions.append(z_next)
+        for t in range(seq_len - 1):
+            current = latent_seq_norm[:, t:t+1, :]
+            next_pred, hidden = gru.predict_next(current, hidden)
+            predictions.append(next_pred)
+        
+        predictions = torch.cat(predictions, dim=1)  # (1, seq_len-1, latent)
+    
+    # Convert to numpy
+    ground_truth = latent_seq_norm[0].cpu().numpy()
+    predictions = predictions[0].cpu().numpy()
+    
+    # Calculate errors
+    # predictions[t] predicts ground_truth[t+1]
+    errors = np.abs(ground_truth[1:, :] - predictions)
+    mean_error_per_dim = errors.mean(axis=0)
+    mean_error_per_timestep = errors.mean(axis=1)
+    
+    # Visualize
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    
+    # Plot 1: First 6 dimensions over time
+    ax = axes[0, 0]
+    timesteps = np.arange(seq_len)
+    for dim in range(min(6, LATENT_DIM)):
+        ax.plot(timesteps, ground_truth[:, dim], 'o-', label=f'GT Dim {dim}', markersize=6, alpha=0.7)
+        # predictions start at t=1
+        ax.plot(timesteps[1:], predictions[:, dim], 'x--', markersize=8, alpha=0.7)
+    
+    ax.set_xlabel('Timestep', fontsize=11)
+    ax.set_ylabel('Latent Value (Normalized)', fontsize=11)
+    ax.set_title('One-Step-Ahead Predictions\n(Solid=Ground Truth, Dashed=Predictions)', fontsize=12, fontweight='bold')
+    ax.legend(fontsize=8, ncol=2)
+    ax.grid(True, alpha=0.3)
+    
+    # Plot 2: Error per dimension
+    ax = axes[0, 1]
+    ax.bar(range(LATENT_DIM), mean_error_per_dim, color='coral', alpha=0.7)
+    ax.set_xlabel('Latent Dimension', fontsize=11)
+    ax.set_ylabel('Mean Absolute Error', fontsize=11)
+    ax.set_title(f'Prediction Error by Dimension\n(Overall MAE: {mean_error_per_dim.mean():.6f})', fontsize=12, fontweight='bold')
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    # Plot 3: Error over time
+    ax = axes[1, 0]
+    ax.plot(timesteps[1:], mean_error_per_timestep, 'o-', color='red', markersize=8, linewidth=2)
+    ax.set_xlabel('Timestep', fontsize=11)
+    ax.set_ylabel('Mean Absolute Error', fontsize=11)
+    ax.set_title('Prediction Error Over Time', fontsize=12, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    
+    # Plot 4: Error distribution
+    ax = axes[1, 1]
+    ax.hist(errors.flatten(), bins=50, color='skyblue', alpha=0.7, edgecolor='black')
+    ax.set_xlabel('Absolute Error', fontsize=11)
+    ax.set_ylabel('Frequency', fontsize=11)
+    ax.set_title(f'Error Distribution\n(Mean: {errors.mean():.6f}, Std: {errors.std():.6f})', fontsize=12, fontweight='bold')
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    plt.suptitle(f'Autoregressive GRU - One-Step Prediction Quality',
+                 fontsize=14, fontweight='bold', y=0.995)
+    plt.tight_layout()
+    
+    # Save
+    output_path = "checkpoints/gru/one_step_predictions.png"
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"✓ Visualization saved: {output_path}\n")
+    
+    # Statistics
+    print("One-Step Prediction Quality:")
+    print(f"  Overall MAE: {mean_error_per_dim.mean():.6f}")
+    print(f"  Max Error (worst dim): {mean_error_per_dim.max():.6f}")
+    print(f"  Min Error (best dim): {mean_error_per_dim.min():.6f}")
+    print(f"  Error Std: {errors.std():.6f}\n")
+    
+    plt.show()
+    return mean_error_per_dim.mean()
+
+
+def visualize_autoregressive_rollout():
+    """
+    Visualize multi-step autoregressive rollout
+    Given the first N states, predict the remaining states autoregressively
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    print("="*60)
+    print("Multi-Step Autoregressive Rollout Visualization")
+    print("="*60 + "\n")
+    
+    # Load models
+    vae, gru = load_models(device)
+    
+    # Load data
+    print("Loading dataset...")
+    dataset = BCIDataset("data/processed/train")
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
+    seq_vectors, _ = next(iter(dataloader))
+    seq_vectors = seq_vectors[0].to(device)
+    print(f"✓ Sequence loaded: {seq_vectors.shape}\n")
+    
+    # Load normalization stats
+    vae_norm_stats = np.load("checkpoints/vae/vae_norm_stats_latent32.npy", allow_pickle=True).item()
+    vae_mean = torch.tensor(vae_norm_stats['mean']).to(device)
+    vae_std = torch.tensor(vae_norm_stats['std']).to(device)
+    
+    latent_stats = np.load("checkpoints/gru/latent_norm_stats_autoregressive.npy", allow_pickle=True).item()
+    latent_mean = torch.tensor(latent_stats['mean']).to(device)
+    latent_std = torch.tensor(latent_stats['std']).to(device)
+    
+    # Encode sequence
+    print("Encoding to latent space...")
+    latent_seq = encode_sequence(vae, seq_vectors, vae_mean, vae_std, device)
+    latent_seq_norm = (latent_seq - latent_mean) / (latent_std + 1e-8)
+    seq_len = latent_seq_norm.shape[1]
+    print(f"✓ Encoded: {latent_seq_norm.shape}\n")
+    
+    # Use first 2 states, predict the rest autoregressively
+    num_seed = 2
+    num_predict = seq_len - num_seed
+    
+    print(f"Autoregressive rollout: Given first {num_seed} states, predict next {num_predict} states...")
+    with torch.no_grad():
+        # Start with first state
+        predictions = []
+        hidden = None
+        current = latent_seq_norm[:, 0:1, :]
+        predictions.append(current)
+        
+        # Process second state to build up hidden state
+        if num_seed > 1:
+            current, hidden = gru.predict_next(current, hidden)
+            predictions.append(current)
+        
+        # Autoregressive rollout
+        for step in range(num_predict):
+            next_state, hidden = gru.predict_next(current, hidden)
+            predictions.append(next_state)
+            current = next_state
         
         predicted_trajectory = torch.cat(predictions, dim=1)[0].cpu().numpy()
     
     ground_truth = latent_seq_norm[0].cpu().numpy()
-    seq_len = ground_truth.shape[0]
     
-    # Plot
-    fig, ax = plt.subplots(1, 1, figsize=(12, 6))
+    # Calculate error for predicted portion
+    predicted_portion = predicted_trajectory[num_seed:]
+    gt_portion = ground_truth[num_seed:]
+    errors = np.abs(predicted_portion - gt_portion)
+    error_per_step = errors.mean(axis=1)
     
+    # Naive baseline: persistence (z[t+1] = z[t])
+    naive_predictions = ground_truth[num_seed-1:-1]  # Shift by 1
+    naive_errors = np.abs(gt_portion - naive_predictions)
+    naive_error_per_step = naive_errors.mean(axis=1)
+    
+    # Visualize
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    
+    # Plot 1: Trajectories
+    ax = axes[0, 0]
+    timesteps = np.arange(seq_len)
     for dim in range(min(6, LATENT_DIM)):
-        ax.plot(range(seq_len), ground_truth[:, dim], 
-                'o-', label=f'GT Dim {dim}', markersize=8, linewidth=2)
-        ax.plot(range(seq_len), predicted_trajectory[:, dim], 
-                'x--', alpha=0.7, markersize=10, linewidth=2)
+        ax.plot(timesteps, ground_truth[:, dim], 'o-', label=f'GT Dim {dim}', 
+                markersize=6, linewidth=2, alpha=0.7)
+        ax.plot(timesteps, predicted_trajectory[:, dim], 'x--', 
+                markersize=8, linewidth=2, alpha=0.7)
     
-    ax.axvline(x=1.5, color='red', linestyle=':', linewidth=2, 
-               label='Prediction starts here')
-    ax.set_xlabel('Timestep', fontsize=12)
-    ax.set_ylabel('Latent Value', fontsize=12)
-    ax.set_title(f'Multi-Step Autoregressive Prediction\n(Given t=0,1 → Predict t=2...{seq_len-1})', 
-                 fontsize=14, fontweight='bold')
+    ax.axvline(x=num_seed-0.5, color='red', linestyle=':', linewidth=2.5, 
+               label=f'Prediction starts (given first {num_seed})')
+    ax.set_xlabel('Timestep', fontsize=11)
+    ax.set_ylabel('Latent Value (Normalized)', fontsize=11)
+    ax.set_title(f'Autoregressive Rollout\n(Solid=Ground Truth, Dashed=Predictions)', 
+                 fontsize=12, fontweight='bold')
+    ax.legend(fontsize=8, ncol=2)
+    ax.grid(True, alpha=0.3)
+    
+    # Plot 2: Error accumulation
+    ax = axes[0, 1]
+    pred_timesteps = timesteps[num_seed:]
+    ax.plot(pred_timesteps, error_per_step, 'o-', color='red', 
+            label='GRU', markersize=8, linewidth=2)
+    ax.plot(pred_timesteps, naive_error_per_step, 's--', color='gray', 
+            label='Naive Baseline', markersize=6, linewidth=2, alpha=0.7)
+    ax.set_xlabel('Timestep', fontsize=11)
+    ax.set_ylabel('Mean Absolute Error', fontsize=11)
+    ax.set_title(f'Error Accumulation Over Rollout\n(GRU vs Baseline)', 
+                 fontsize=12, fontweight='bold')
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
     
+    # Plot 3: Cumulative error
+    ax = axes[1, 0]
+    cumulative_gru = np.cumsum(error_per_step)
+    cumulative_naive = np.cumsum(naive_error_per_step)
+    ax.plot(pred_timesteps, cumulative_gru, 'o-', color='red', 
+            label='GRU', markersize=8, linewidth=2)
+    ax.plot(pred_timesteps, cumulative_naive, 's--', color='gray', 
+            label='Naive Baseline', markersize=6, linewidth=2, alpha=0.7)
+    ax.set_xlabel('Timestep', fontsize=11)
+    ax.set_ylabel('Cumulative Error', fontsize=11)
+    ax.set_title('Cumulative Error Over Time', fontsize=12, fontweight='bold')
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    
+    # Plot 4: Error comparison
+    ax = axes[1, 1]
+    gru_mae = errors.mean()
+    naive_mae = naive_errors.mean()
+    
+    bars = ax.bar(['GRU\nAutoregressive', 'Naive\nPersistence'], 
+                  [gru_mae, naive_mae], 
+                  color=['coral', 'lightgray'], alpha=0.8, edgecolor='black', linewidth=2)
+    
+    # Add values on bars
+    for bar in bars:
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height,
+                f'{height:.6f}',
+                ha='center', va='bottom', fontsize=12, fontweight='bold')
+    
+    improvement = (naive_mae - gru_mae) / naive_mae * 100
+    ax.set_ylabel('Mean Absolute Error', fontsize=11)
+    ax.set_title(f'Overall Performance Comparison\n(GRU improves by {improvement:.1f}%)', 
+                 fontsize=12, fontweight='bold')
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    plt.suptitle(f'Autoregressive GRU - Multi-Step Rollout Quality',
+                 fontsize=14, fontweight='bold', y=0.995)
     plt.tight_layout()
-    plt.savefig("checkpoints/gru/multistep_prediction.png", dpi=150, bbox_inches='tight')
-    print("\n✓ Multi-step visualization saved")
+    
+    # Save
+    output_path = "checkpoints/gru/autoregressive_rollout.png"
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"✓ Visualization saved: {output_path}\n")
+    
+    # Statistics
+    print("Autoregressive Rollout Quality:")
+    print(f"  GRU MAE: {gru_mae:.6f}")
+    print(f"  Naive MAE: {naive_mae:.6f}")
+    print(f"  Improvement: {improvement:.2f}%")
+    print(f"  Final step error (GRU): {error_per_step[-1]:.6f}")
+    print(f"  Final step error (Naive): {naive_error_per_step[-1]:.6f}\n")
+    
     plt.show()
+    return gru_mae, naive_mae
 
-def check_naive_baseline(latent_sequences, device, skip_steps=1):
-    """
-    Calculate error if we simply predicted: "The future is the same as the present".
-    Z_{t+skip} = Z_t
-    """
-    print(f"\n--- Naive Baseline Calculation (Skip={skip_steps}) ---")
-    
-    # Input: Current state (all except last skip_steps)
-    current_state = latent_sequences[:, :-skip_steps, :].to(device)
-    
-    # Target: Future state (all starting from skip_steps)
-    future_real = latent_sequences[:, skip_steps:, :].to(device)
-    
-    # Naive Prediction: Copy current state
-    naive_pred = current_state
-    
-    # Calculate MSE
-    mse = F.mse_loss(naive_pred, future_real)
-    print(f"Naive Baseline MSE: {mse.item():.6f}")
-    return mse.item()
 
-def evaluate_model_vs_baseline():
+def evaluate_full_dataset():
     """
-    Compare GRU model performance against Naive Baseline
+    Evaluate autoregressive performance on full dataset
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    
     print("="*60)
-    print("Model vs Baseline Comparison")
-    print("="*60)
+    print("Full Dataset Autoregressive Evaluation")
+    print("="*60 + "\n")
     
-    # 1. Load VAE
-    print(f"Loading VAE from {VAE_PATH}...")
-    vae = VAE(input_dim=INPUT_DIM, latent_dim=LATENT_DIM).to(device)
-    vae.load_state_dict(torch.load(VAE_PATH, map_location=device))
-    vae.eval()
+    # Load models
+    vae, gru = load_models(device)
     
-    # 2. Load GRU
-    print(f"Loading GRU from {GRU_PATH}...")
-    gru = TemporalGRU(
-        latent_dim=LATENT_DIM,
-        hidden_dim=HIDDEN_DIM,
-        num_layers=NUM_LAYERS
-    ).to(device)
-    gru.load_state_dict(torch.load(GRU_PATH, map_location=device))
-    gru.eval()
-    
-    # 3. Load Data
-    print("Loading dataset...")
+    # Load data
+    print("Loading full dataset...")
     dataset = BCIDataset("data/processed/train")
     dataloader = DataLoader(dataset, batch_size=64, shuffle=False)
+    print(f"✓ Dataset loaded: {len(dataset)} sequences\n")
     
-    # 4. Encode to Latent Space
-    print("Encoding data to latent space...")
-    
-    # Load stats
-    stats_path = f"checkpoints/vae/vae_norm_stats_latent{LATENT_DIM}.npy"
-    if not os.path.exists(stats_path):
-        # Fallback to generic name if specific not found
-        stats_path = "checkpoints/vae/vae_norm_stats.npy"
-        
-    print(f"Loading normalization stats from {stats_path}")
-    vae_norm_stats = np.load(stats_path, allow_pickle=True).item()
+    # Load normalization stats
+    vae_norm_stats = np.load("checkpoints/vae/vae_norm_stats_latent32.npy", allow_pickle=True).item()
     vae_mean = torch.tensor(vae_norm_stats['mean']).to(device)
     vae_std = torch.tensor(vae_norm_stats['std']).to(device)
     
+    latent_stats = np.load("checkpoints/gru/latent_norm_stats_autoregressive.npy", allow_pickle=True).item()
+    latent_mean = torch.tensor(latent_stats['mean']).to(device)
+    latent_std = torch.tensor(latent_stats['std']).to(device)
+    
+    # Encode all sequences
+    print("Encoding full dataset...")
     all_latents = []
     with torch.no_grad():
         for batch_seq, _ in dataloader:
@@ -421,71 +414,89 @@ def evaluate_model_vs_baseline():
             # Reshape
             latent_seq = mu.view(batch_size, seq_len, -1)
             all_latents.append(latent_seq)
-            
+    
     latent_sequences = torch.cat(all_latents, dim=0)
     
-    # 5. Normalize Latent Space (Same as training)
-    latent_mean = latent_sequences.mean()
-    latent_std = latent_sequences.std()
+    # Normalize latent space
     latent_normalized = (latent_sequences - latent_mean) / (latent_std + 1e-8)
+    print(f"✓ Encoded: {latent_normalized.shape}\n")
     
-    print(f"Latent Data Shape: {latent_normalized.shape}")
+    # Evaluate autoregressive prediction
+    print("Evaluating autoregressive predictions...")
+    total_gru_error = 0
+    total_naive_error = 0
+    total_elements = 0
     
-    # 6. Calculate Baseline
-    # Assuming SKIP_STEPS=4 based on training config, but let's check what the user wants.
-    # The user's snippet had skip_steps=1 default. 
-    # We should use the SKIP_STEPS constant if defined, or default to 4.
-    skip = 4 # Default to 4 as per our training
-    baseline_mse = check_naive_baseline(latent_normalized, device, skip_steps=skip)
-    
-    # 7. Calculate GRU MSE
-    print(f"\n--- Calculating GRU MSE (Skip={skip}) ---")
-    inputs = latent_normalized[:, :-skip, :]
-    targets = latent_normalized[:, skip:, :]
-    
-    # Process in batches to avoid OOM
-    total_mse = 0
-    count = 0
     batch_size = 64
-    
     with torch.no_grad():
-        for i in range(0, inputs.shape[0], batch_size):
-            batch_input = inputs[i:i+batch_size].to(device)
-            batch_target = targets[i:i+batch_size].to(device)
+        for i in range(0, latent_normalized.shape[0], batch_size):
+            batch = latent_normalized[i:i+batch_size].to(device)
+            b_size, seq_len = batch.shape[0], batch.shape[1]
             
-            delta_pred, _ = gru(batch_input)
+            # Autoregressive prediction
+            predictions = []
+            hidden = None
+            current = batch[:, 0:1, :]
             
-            # GRU predicts delta, so predicted_next = current + delta
-            # But we are comparing against target (which is next state)
-            # Wait, train_gru calculates MSE on DELTA.
-            # target_delta = batch_target - batch_input
-            # loss = F.mse_loss(delta_pred, target_delta)
+            for t in range(seq_len - 1):
+                next_state, hidden = gru.predict_next(current, hidden)
+                predictions.append(next_state)
+                current = next_state
             
-            # Let's calculate MSE on the actual state reconstruction to be comparable to baseline
-            # Pred State = Input + Delta
-            pred_state = batch_input + delta_pred
+            pred_seq = torch.cat(predictions, dim=1)
             
-            mse = F.mse_loss(pred_state, batch_target, reduction='sum')
-            total_mse += mse.item()
-            count += batch_input.numel()
+            # GRU error
+            target = batch[:, 1:, :]
+            gru_error = F.l1_loss(pred_seq, target, reduction='sum')
+            total_gru_error += gru_error.item()
             
-    gru_mse = total_mse / count
-    print(f"GRU Model MSE: {gru_mse:.6f}")
+            # Naive error (persistence)
+            naive_pred = batch[:, :-1, :]
+            naive_error = F.l1_loss(naive_pred, target, reduction='sum')
+            total_naive_error += naive_error.item()
+            
+            total_elements += target.numel()
     
-    # 8. Conclusion
-    print("\n" + "-"*30)
+    gru_mae = total_gru_error / total_elements
+    naive_mae = total_naive_error / total_elements
+    improvement = (naive_mae - gru_mae) / naive_mae * 100
+    
+    print("\n" + "="*60)
     print("RESULTS")
-    print("-" * 30)
-    print(f"Baseline MSE: {baseline_mse:.6f}")
-    print(f"GRU Model MSE: {gru_mse:.6f}")
+    print("="*60)
+    print(f"GRU MAE (autoregressive): {gru_mae:.6f}")
+    print(f"Naive Baseline MAE: {naive_mae:.6f}")
+    print(f"Improvement: {improvement:.2f}%")
     
-    if gru_mse < baseline_mse:
-        improvement = (baseline_mse - gru_mse) / baseline_mse * 100
-        print(f"✅ SUCCESS: GRU beats baseline by {improvement:.2f}%")
+    if improvement > 0:
+        print("✅ SUCCESS: GRU beats naive baseline!")
     else:
-        print("❌ FAILURE: GRU is worse or equal to baseline (Lazy Predictor)")
+        print("❌ WARNING: GRU does not beat baseline")
+    
+    print("="*60 + "\n")
+    
+    return gru_mae, naive_mae
+
 
 if __name__ == "__main__":
-    visualize_predictions()
-    visualize_multi_step()
-    evaluate_model_vs_baseline()
+    # Run all visualizations
+    print("\n" + "🎨 "*20)
+    print("Autoregressive GRU Visualization Suite")
+    print("🎨 "*20 + "\n")
+    
+    # 1. One-step predictions
+    one_step_error = visualize_one_step_predictions()
+    
+    print("\n" + "-"*60 + "\n")
+    
+    # 2. Multi-step rollout
+    gru_rollout_mae, naive_rollout_mae = visualize_autoregressive_rollout()
+    
+    print("\n" + "-"*60 + "\n")
+    
+    # 3. Full dataset evaluation
+    gru_full_mae, naive_full_mae = evaluate_full_dataset()
+    
+    print("\n" + "🎉 "*20)
+    print("All visualizations complete!")
+    print("🎉 "*20 + "\n")
