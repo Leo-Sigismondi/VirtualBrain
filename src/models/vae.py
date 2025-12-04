@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class VAE(nn.Module):
-    def __init__(self, input_dim=325, hidden_dim=128, latent_dim=64):
+    def __init__(self, input_dim=253, hidden_dim=128, latent_dim=64):
         super(VAE, self).__init__()
         
         # --- ENCODER ---

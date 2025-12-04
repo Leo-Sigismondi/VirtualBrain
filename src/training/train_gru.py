@@ -26,19 +26,19 @@ BATCH_SIZE = 128
 EPOCHS = 500
 LEARNING_RATE = 1e-3
 LATENT_DIM = 32
-HIDDEN_DIM = 64
-NUM_LAYERS = 4
+HIDDEN_DIM = 128
+NUM_LAYERS = 2
 DROPOUT = 0.1
-INPUT_DIM = 325
+INPUT_DIM = 253
 
 # Autoregressive training config
-TEACHER_FORCING_EPOCHS = 400  # Warmup epochs with full teacher forcing
+TEACHER_FORCING_EPOCHS = 50  # Warmup epochs with full teacher forcing
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-VAE_PATH = "checkpoints/vae/vae_latent32_best.pth"
+VAE_PATH = "checkpoints/vae/vae_temporal_latent32_best.pth"
 SAVE_DIR = "checkpoints/gru"
-SAVE_PATH = f"{SAVE_DIR}/gru_autoregressive_L32_H64_4L.pth"
-BEST_MODEL_PATH = f"{SAVE_DIR}/gru_autoregressive_L32_H64_4L_best.pth"
+SAVE_PATH = f"{SAVE_DIR}/gru_autoregressive_L32_H128_2L.pth"
+BEST_MODEL_PATH = f"{SAVE_DIR}/gru_autoregressive_L32_H128_2L_best.pth"
 
 
 def encode_to_latent(vae_model, dataloader, device, norm_stats=None):
@@ -174,6 +174,12 @@ def train_epoch_autoregressive(model, inputs, targets, optimizer, device, epoch,
         
         total_loss += loss.item()
         num_batches += 1
+        
+        # Monitor delta magnitude
+        # pred_sequence is z_{t+1}, batch_inputs is z_t (mostly)
+        # delta = pred_sequence - batch_inputs (approx)
+        # This is just for debugging print
+        pass
     
     avg_loss = total_loss / num_batches
     

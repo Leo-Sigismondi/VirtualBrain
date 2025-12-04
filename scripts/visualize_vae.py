@@ -19,10 +19,10 @@ from src.models.vae import VAE
 from src.preprocessing.geometry_utils import vec_to_sym_matrix
 
 # --- CONFIG ---
-CHECKPOINT_PATH = "checkpoints/vae/vae_latent32_best.pth"  # Use best model
+CHECKPOINT_PATH = "checkpoints/vae/vae_temporal_latent32_best.pth"  # Use best model
 LATENT_DIM = 32 # Match your training config
-INPUT_DIM = 325
-N_CHANNELS = 25  # Calculated from 325 -> 25*26/2 = 325
+INPUT_DIM = 253
+N_CHANNELS = 22  # Calculated from 253 -> 22*23/2 = 253
 
 def visualize_reconstruction():
     """
@@ -175,11 +175,74 @@ def compare_latent_dims():
     print("Comparison saved to: checkpoints/vae/latent_dim_comparison.png")
     plt.show()
 
+def visualize_latent_dynamics():
+    """
+    Visualize latent space trajectories to check for smoothness
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print("\n" + "="*60)
+    print("Latent Dynamics Visualization")
+    print("="*60)
+    
+    # 1. Load Data
+    ds = BCIDataset("data/processed/train")
+    dl = DataLoader(ds, batch_size=1, shuffle=True)
+    
+    # 2. Load Model
+    model = VAE(input_dim=INPUT_DIM, latent_dim=LATENT_DIM).to(device)
+    model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device))
+    model.eval()
+    
+    # 3. Load Stats
+    stats_path = f"checkpoints/vae/vae_norm_stats_latent{LATENT_DIM}.npy"
+    norm_stats = np.load(stats_path, allow_pickle=True).item()
+    mean = torch.tensor(norm_stats['mean']).to(device)
+    std = torch.tensor(norm_stats['std']).to(device)
+    
+    # 4. Get a sequence
+    seq_vectors, _ = next(iter(dl))
+    seq_vectors = seq_vectors.to(device) # (1, Seq_Len, Feat)
+    
+    # 5. Encode sequence
+    latent_seq = []
+    with torch.no_grad():
+        for t in range(seq_vectors.shape[1]):
+            frame = seq_vectors[:, t, :]
+            norm_frame = (frame - mean) / std
+            mu, _ = model.encode(norm_frame)
+            latent_seq.append(mu)
+    
+    latent_seq = torch.cat(latent_seq, dim=0).cpu().numpy() # (Seq_Len, Latent)
+    
+    # 6. Plot
+    fig, ax = plt.subplots(figsize=(12, 6))
+    timesteps = np.arange(latent_seq.shape[0])
+    
+    # Plot first 5 dimensions
+    for i in range(min(5, LATENT_DIM)):
+        ax.plot(timesteps, latent_seq[:, i], 'o-', label=f'Dim {i}')
+        
+    ax.set_title("Latent Trajectories (First 5 Dims)")
+    ax.set_xlabel("Timestep")
+    ax.set_ylabel("Latent Value")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    output_path = "checkpoints/vae/latent_dynamics.png"
+    plt.savefig(output_path, dpi=150)
+    print(f"Visualization saved to: {output_path}")
+    
+    # Calculate smoothness metric (mean squared velocity)
+    velocity = np.diff(latent_seq, axis=0)
+    smoothness = np.mean(velocity**2)
+    print(f"Smoothness Metric (lower is smoother): {smoothness:.6f}")
+
 if __name__ == "__main__":
     print("="*60)
     print("VAE Reconstruction Visualization")
     print("="*60)
     visualize_reconstruction()
+    visualize_latent_dynamics()
     
     # Uncomment to compare different latent dimensions
     # compare_latent_dims()

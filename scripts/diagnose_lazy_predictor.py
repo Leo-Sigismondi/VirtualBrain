@@ -18,7 +18,7 @@ VAE_PATH = "checkpoints/vae/vae_latent32_best.pth"
 GRU_PATH = "checkpoints/gru/gru_L32_H128_Lay1_best.pth"
 LATENT_DIM = 32
 HIDDEN_DIM = 128
-INPUT_DIM = 325
+INPUT_DIM = 253
 NUM_LAYERS = 1
 SKIP_STEPS = 4
 

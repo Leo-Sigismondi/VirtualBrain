@@ -1,0 +1,46 @@
+﻿.venv\Scripts\python.exe : Traceback (most recent call last):
+In riga:1 car:1
++ .venv\Scripts\python.exe -c "import sys; sys.path.insert(0, 
+'.'); fro ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~
+    + CategoryInfo          : NotSpecified: (Traceback (most rec   
+ ent call last)::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  File "<string>", line 1, in <module>
+  File 
+"E:\Programming\VirtualBrain\scripts\diagnose_latent_dynamics.py", 
+line 115, in <module>
+    print("   \u2713 Reasonable autocorrelation\n")
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Pytho
+n.3.11_3.11.2544.0_x64__qbz5n2kfra8p0\Lib\encodings\cp1252.py", 
+line 19, in encode
+    return 
+codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character 
+'\u2713' in position 3: character maps to <undefined>
+============================================================
+Latent Space Temporal Dynamics Diagnosis
+============================================================
+
+Loading VAE...
+Loading dataset...
+Caricamento dataset da data/processed/train...
+Dataset Caricato. Shape totale: torch.Size([2592, 13, 325])
+Encoding to latent space...
+Latent sequences shape: torch.Size([2592, 13, 32])
+
+============================================================
+TEMPORAL DYNAMICS ANALYSIS
+============================================================
+
+1. TEMPORAL VELOCITY
+   Mean velocity magnitude: 3.177898
+   Std velocity magnitude: 0.809840
+   Max velocity: 15.182917
+   Min velocity: 1.042958
+
+2. TEMPORAL AUTOCORRELATION
+   Lag-1 autocorrelation: 0.825517

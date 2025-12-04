@@ -56,7 +56,9 @@ def extract_and_process_subject(filename, subject_id):
     
     # 2. Channel Selection and Filtering
     # BCI IV 2a has 22 EEG channels. Select only those.
-    raw.pick('eeg', exclude='bads') 
+    # BCI IV 2a has 22 EEG channels + 3 EOG. Select only the first 22 EEG.
+    # We explicitly pick the first 22 channels to avoid EOGs which might be mislabeled or included.
+    raw.pick_channels(raw.ch_names[:22]) 
     raw.filter(F_MIN, F_MAX, fir_design='firwin', verbose='ERROR')
     
     # 3. Event Extraction (IMPROVED)
@@ -80,7 +82,7 @@ def extract_and_process_subject(filename, subject_id):
     # Create Epochs only for selected events
     # tmin=0, tmax=4.0 (standard MI trial duration in this dataset)
     epochs = mne.Epochs(raw, events, event_id=selected_ids, 
-                        tmin=0, tmax=4.0, baseline=None, preload=True, verbose='ERROR')
+                        tmin=2.0, tmax=6.0, baseline=None, preload=True, verbose='ERROR')
     
     # 4. Sliding Window & Covariance Estimation
     subject_covariances = []

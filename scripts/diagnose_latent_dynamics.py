@@ -17,9 +17,9 @@ from torch.utils.data import DataLoader
 from src.models.vae import VAE
 
 # Config
-VAE_PATH = "checkpoints/vae/vae_latent32_best.pth"
+VAE_PATH = "checkpoints/vae/vae_temporal_latent32_best.pth"
 LATENT_DIM = 32
-INPUT_DIM = 325
+INPUT_DIM = 253
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 

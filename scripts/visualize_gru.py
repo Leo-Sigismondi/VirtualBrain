@@ -24,12 +24,12 @@ from src.models.gru import TemporalGRU
 sys.stdout.reconfigure(encoding='utf-8')
 
 # --- CONFIG ---
-VAE_PATH = "checkpoints/vae/vae_latent32_best.pth"
-GRU_PATH = "checkpoints/gru/gru_autoregressive_L32_H64_4L_best.pth"
+VAE_PATH = "checkpoints/vae/vae_temporal_latent32_best.pth"
+GRU_PATH = "checkpoints/gru/gru_autoregressive_L32_H128_2L_best.pth"
 LATENT_DIM = 32
-HIDDEN_DIM = 64
-INPUT_DIM = 325
-NUM_LAYERS = 4
+HIDDEN_DIM = 128
+INPUT_DIM = 253
+NUM_LAYERS = 2
 
 
 def load_models(device):
