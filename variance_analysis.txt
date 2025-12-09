@@ -1,5 +1,0 @@
-Ground Truth Dynamics Analysis:
-  Avg Std across dims: 0.932132
-  Max Std in any dim: 1.908286
-  Avg Range (max-min): 3.102379
-  Max Range in any dim: 6.006378

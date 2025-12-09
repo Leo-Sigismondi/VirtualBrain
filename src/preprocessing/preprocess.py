@@ -44,10 +44,12 @@ def ensure_spd(matrix, epsilon=1e-5):
 
 def extract_and_process_subject(filename, subject_id):
     """
-    Loads a GDF file, applies filters, extracts windows and computes covariances.
+    Loads a GDF file, applies filters, and extracts continuous sliding windows.
+    Returns:
+        covariances: (N_Windows, Channels, Channels)
+        labels: (N_Windows,) - 0 for rest, 1-4 for tasks
     """
-    # 1. Load Data (FIXED: removed eog=True)
-    # MNE will read channel types directly from GDF header
+    # 1. Load Data
     try:
         raw = mne.io.read_raw_gdf(filename, preload=True, verbose='ERROR')
     except Exception as e:
@@ -55,73 +57,71 @@ def extract_and_process_subject(filename, subject_id):
         return np.array([]), np.array([])
     
     # 2. Channel Selection and Filtering
-    # BCI IV 2a has 22 EEG channels. Select only those.
-    # BCI IV 2a has 22 EEG channels + 3 EOG. Select only the first 22 EEG.
-    # We explicitly pick the first 22 channels to avoid EOGs which might be mislabeled or included.
+    # Select first 22 EEG channels
     raw.pick_channels(raw.ch_names[:22]) 
     raw.filter(F_MIN, F_MAX, fir_design='firwin', verbose='ERROR')
     
-    # 3. Event Extraction (IMPROVED)
-    # Extract annotations (e.g. '769') and map to integer IDs
+    # 3. Extract Events for Labeling
     events, event_id_map = mne.events_from_annotations(raw, verbose='ERROR')
     
-    # We only want events corresponding to Motor Imagery (769...772)
-    # Filter event_id_map to find integer IDs that MNE assigned
-    selected_ids = []
-    selected_descriptions = []
+    # Create a label array for the entire raw duration
+    # Default to 0 (Rest)
+    raw_labels = np.zeros(len(raw.times), dtype=int)
+    
+    # Map events to class IDs (1-4)
+    # 769->1, 770->2, 771->3, 772->4
+    event_mapping = {
+        '769': 1, '770': 2, '771': 3, '772': 4
+    }
+    
+    # Fill labels based on events
+    # Standard trial duration is 4 seconds (from t=0 to t=4 relative to event)
+    # But we want to capture the transition, so we mark the 4s window as the task.
+    sfreq = raw.info['sfreq']
+    trial_samples = int(4.0 * sfreq)
     
     for desc, int_id in event_id_map.items():
-        if desc in TARGET_EVENT_IDS:
-            selected_ids.append(int_id)
-            selected_descriptions.append(desc)
-    
-    if not selected_ids:
-        print(f"No target events found in {subject_id}. Events found: {list(event_id_map.keys())}")
-        return np.array([]), np.array([])
-
-    # Create Epochs only for selected events
-    # tmin=0, tmax=4.0 (standard MI trial duration in this dataset)
-    epochs = mne.Epochs(raw, events, event_id=selected_ids, 
-                        tmin=2.0, tmax=6.0, baseline=None, preload=True, verbose='ERROR')
+        if desc in event_mapping:
+            class_id = event_mapping[desc]
+            # Find all timestamps for this event
+            event_indices = events[events[:, 2] == int_id, 0]
+            
+            for start_idx in event_indices:
+                end_idx = start_idx + trial_samples
+                if end_idx <= len(raw_labels):
+                    raw_labels[start_idx:end_idx] = class_id
     
     # 4. Sliding Window & Covariance Estimation
-    subject_covariances = []
-    subject_labels = []
+    # We slide over the CONTINUOUS raw data
+    data = raw.get_data() # (Channels, Time)
+    n_samples = data.shape[1]
     
-    win_samples = int(WINDOW_SIZE * raw.info['sfreq'])
-    step_samples = int(STRIDE * raw.info['sfreq'])
-    estimator = LedoitWolf(store_precision=False, assume_centered=False)  # FIXED: EEG is NOT centered!
+    win_samples = int(WINDOW_SIZE * sfreq)
+    step_samples = int(STRIDE * sfreq)
+    estimator = LedoitWolf(store_precision=False, assume_centered=False)
     
-    n_epochs = len(epochs)
-    if n_epochs == 0:
-        return np.array([]), np.array([])
-
-    epoch_data = epochs.get_data(copy=False) # Shape: (N_Trials, Channels, Time)
-    epoch_events = epochs.events[:, 2]       # Shape: (N_Trials,)
-
-    for i in range(n_epochs):
-        trial_data = epoch_data[i] # (22, 1001)
-        trial_label = epoch_events[i]
+    covariances = []
+    window_labels = []
+    
+    # Slide window
+    for t in range(0, n_samples - win_samples, step_samples):
+        window = data[:, t : t + win_samples]
         
-        trial_sequence = []
+        # Label for this window: use the mode (most frequent label) or the center label
+        # Let's use the label at the center of the window
+        center_idx = t + win_samples // 2
+        label = raw_labels[center_idx]
         
-        # Sliding Window
-        for t in range(0, trial_data.shape[1] - win_samples, step_samples):
-            window = trial_data[:, t : t + win_samples]
+        # Compute Covariance
+        try:
+            cov = estimator.fit(window.T).covariance_
+            cov, _ = ensure_spd(cov)
+            covariances.append(cov)
+            window_labels.append(label)
+        except Exception:
+            continue
             
-            # Covariance
-            try:
-                cov = estimator.fit(window.T).covariance_
-                cov, _ = ensure_spd(cov)
-                trial_sequence.append(cov)
-            except Exception:
-                continue # Skip if LedoitWolf fails (rare)
-            
-        if len(trial_sequence) > 0:
-            subject_covariances.append(np.array(trial_sequence))
-            subject_labels.append(trial_label)
-
-    return np.array(subject_covariances), np.array(subject_labels)
+    return np.array(covariances), np.array(window_labels)
 
 def main():
     # 0. Setup Folders
@@ -158,8 +158,9 @@ def main():
         save_file = os.path.join(output_dir, f"{subj_id}_cov.npy")
         label_file = os.path.join(output_dir, f"{subj_id}_labels.npy")
         
-        if os.path.exists(save_file):
-            continue
+        # FORCE OVERWRITE for new continuous data
+        # if os.path.exists(save_file):
+        #     continue
             
         cov_seqs, labels = extract_and_process_subject(full_path, subj_id)
         

@@ -1,7 +1,54 @@
 """
-VAE Training Script with Temporal Loss
-Trains VAE to encode temporal dynamics, not just static features
+VAE Training Script with Dynamics-Encouraging Loss
+===================================================
+
+WHY WE CHANGED THE TEMPORAL LOSS:
+---------------------------------
+The original loss had a SMOOTHNESS PENALTY:
+    smoothness_loss = (z[t+1] - z[t])^2
+    
+This is COUNTER-PRODUCTIVE because:
+1. It explicitly penalizes temporal dynamics (differences between states)
+2. The model learns to make consecutive states nearly identical
+3. Result: lag-1 autocorrelation of 0.825 (too high!)
+4. When states barely change, naive baseline (z[t+1] = z[t]) is optimal
+5. GRU learns "do nothing" is the best strategy
+
+NEW LOSS PHILOSOPHY:
+-------------------
+We want latent representations that:
+1. PRESERVE TEMPORAL DYNAMICS - consecutive states should be DIFFERENT enough
+2. NOT BE RANDOM - still want smooth, interpretable trajectories
+3. CAPTURE MEANINGFUL CHANGES - state differences should reflect real EEG changes
+
+The new loss encourages a "Goldilocks" level of dynamics:
+- Not too smooth (old problem)
+- Not too noisy (meaningless)
+- Just right for prediction
+
+LOSS COMPONENTS EXPLAINED:
+-------------------------
+1. RECONSTRUCTION LOSS (MSE):
+   - Standard VAE component
+   - Ensures latent space captures input information
+   
+2. KL DIVERGENCE:
+   - Regularizes latent space toward N(0,1)
+   - Prevents mode collapse
+   - With beta-VAE we can control the balance
+   
+3. DYNAMICS LOSS (NEW):
+   a) Velocity Target Loss:
+      - Penalize when average velocity is TOO LOW
+      - Target: mean |z[t+1] - z[t]| >= min_velocity
+      - This prevents the "frozen latent" problem
+      
+   b) Temporal Diversity Loss:
+      - Encourage different trajectory directions at different times
+      - Penalize when all velocities point the same direction
+      - This prevents "monotonic drift" where latent just trends one way
 """
+
 import sys
 from pathlib import Path
 
@@ -15,64 +62,152 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from src.data.dataset import BCIDataset
-from src.models.vae import VAE
+from src.models.vae import ImprovedVAE
 import os
 import numpy as np
+from tqdm import tqdm
 
 # --- CONFIG ---
-BATCH_SIZE = 64
-EPOCHS = 500
-LEARNING_RATE = 1e-3
+BATCH_SIZE = 512
+EPOCHS = 100
+LEARNING_RATE = 5e-4  # Slightly higher for new architecture
 LATENT_DIM = 32
 INPUT_DIM = 253
-TEMPORAL_WEIGHT = 5  # Weight for temporal loss components
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+SEQUENCE_LENGTH = 64
 
-def temporal_vae_loss(recon_x, x, mu, logvar, mu_sequence, temporal_weight=0.1):
+# Loss weights (carefully tuned)
+BETA = 0.5          # KL weight (beta-VAE style, lower = more reconstruction focus)
+DYNAMICS_WEIGHT = 2.0  # Weight for dynamics-encouraging loss
+
+# Dynamics loss hyperparameters
+MIN_VELOCITY = 0.15    # Minimum desired velocity magnitude (in normalized latent space)
+TARGET_AUTOCORR = 0.6  # Target lag-1 autocorrelation (lower than current 0.825)
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+SAVE_DIR = "checkpoints/vae"
+
+
+def dynamics_encouraging_loss(mu_sequence, min_velocity=0.15, target_autocorr=0.6):
     """
-    Enhanced VAE loss with temporal consistency
+    Loss function that ENCOURAGES temporal dynamics instead of suppressing them.
     
     Args:
-        recon_x: Reconstructed data (flattened sequence)
-        x: Original data (flattened sequence)
-        mu: Latent mu (flattened sequence)
-        logvar: Latent logvar (flattened sequence)
-        mu_sequence: Latent mu reshaped to (batch, seq_len, latent)
-        temporal_weight: Weight for temporal loss components
-    
+        mu_sequence: (Batch, Seq_Len, Latent) - latent trajectories
+        min_velocity: Minimum desired average velocity magnitude
+        target_autocorr: Target lag-1 autocorrelation
+        
     Returns:
-        total_loss, mse, kld, temporal_loss
+        dynamics_loss: Scalar loss encouraging good dynamics
+        diagnostics: Dict with individual loss components
+    
+    WHY THESE SPECIFIC COMPONENTS:
+    
+    1. VELOCITY MAGNITUDE LOSS:
+       - We compute velocity = z[t+1] - z[t] at each timestep
+       - We want mean(|velocity|) >= min_velocity
+       - If too low, we penalize: loss = (min_velocity - mean_velocity)^2
+       - This directly combats the "frozen latent" problem
+    
+    2. VELOCITY DIVERSITY LOSS:
+       - If all velocities are the same direction, dynamics are boring
+       - We measure std(velocity) across time
+       - Low std = monotonic trajectory = bad
+       - We penalize: loss = 1 / (velocity_std + eps)
     """
-    # Standard VAE loss components
-    MSE = F.mse_loss(recon_x, x, reduction='sum')
-    KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    batch_size, seq_len, latent_dim = mu_sequence.shape
     
-    # TEMPORAL LOSS COMPONENTS
+    # 1. COMPUTE VELOCITIES
+    # Velocity is the difference between consecutive latent states
+    # Shape: (Batch, Seq_Len-1, Latent)
+    velocity = mu_sequence[:, 1:, :] - mu_sequence[:, :-1, :]
     
-    # 1. Smoothness penalty - consecutive latents shouldn't jump wildly
-    # This encourages gradual changes over time
-    latent_velocity = mu_sequence[:, 1:, :] - mu_sequence[:, :-1, :]
-    smoothness_loss = latent_velocity.pow(2).sum()
+    # 2. VELOCITY MAGNITUDE LOSS
+    # We want velocities to have non-trivial magnitude
+    velocity_magnitude = torch.norm(velocity, dim=-1)  # (Batch, Seq_Len-1)
+    mean_velocity = velocity_magnitude.mean()
     
-    # 2. Anti-static penalty - latents should change meaningfully over time
-    # Penalize sequences with low variance (nearly flat)
-    within_seq_var = mu_sequence.var(dim=1).sum()  # Variance across timesteps
-    static_penalty = 1.0 / (within_seq_var + 1e-6)  # Higher when variance is low
+    # Penalize if mean velocity is below threshold
+    # Using smooth penalty: max(0, min_velocity - mean_velocity)^2
+    velocity_deficit = F.relu(min_velocity - mean_velocity)
+    velocity_loss = velocity_deficit.pow(2) * 100  # Scale up for gradient magnitude
     
-    # Combined temporal loss
-    # Balance: want smooth changes (low smoothness_loss) but not too flat (low static_penalty)
-    temporal_loss = smoothness_loss + 0.5 * static_penalty
+    # 3. VELOCITY DIVERSITY LOSS  
+    # Measure how diverse the velocities are across time
+    # High std = velocities change direction/magnitude = good dynamics
+    velocity_std = velocity.std(dim=1).mean()  # Std across time, then average
     
-    # Total loss
-    total_loss = MSE + KLD + temporal_weight * temporal_loss
+    # Penalize low diversity (but don't let it dominate)
+    diversity_loss = 1.0 / (velocity_std + 0.1)
     
-    return total_loss, MSE.item(), KLD.item(), temporal_loss.item()
+    # 4. ANTI-COLLAPSE LOSS
+    # Ensure latent space uses multiple dimensions
+    # Measure utilization: variance across latent dimensions should be similar
+    dim_variance = mu_sequence.var(dim=(0, 1))  # Variance per dimension
+    variance_uniformity = dim_variance.std() / (dim_variance.mean() + 1e-6)
+    collapse_loss = variance_uniformity  # Penalize if some dims have much more variance
+    
+    # COMBINE LOSSES
+    # Total dynamics loss encourages:
+    # - Sufficient velocity (not frozen)
+    # - Diverse velocities (not monotonic)
+    # - Uniform dimension usage (not collapsed)
+    total_dynamics_loss = velocity_loss + 0.5 * diversity_loss + 0.3 * collapse_loss
+    
+    # Diagnostics for monitoring
+    diagnostics = {
+        'mean_velocity': mean_velocity.item(),
+        'velocity_std': velocity_std.item(),
+        'velocity_loss': velocity_loss.item(),
+        'diversity_loss': diversity_loss.item(),
+        'collapse_loss': collapse_loss.item()
+    }
+    
+    return total_dynamics_loss, diagnostics
+
+
+def vae_loss_with_dynamics(recon_x, x, mu, logvar, mu_sequence, beta=0.5, dynamics_weight=1.0):
+    """
+    Complete VAE loss with dynamics-encouraging component.
+    
+    Components:
+    1. Reconstruction loss (MSE) - preserve input information
+    2. KL divergence - regularize latent space
+    3. Dynamics loss - encourage temporal dynamics
+    
+    Args:
+        recon_x: Reconstructed data (flattened)
+        x: Original data (flattened)
+        mu: Latent means (flattened)
+        logvar: Latent log-variances (flattened)
+        mu_sequence: Latent means reshaped to (batch, seq, latent)
+        beta: Weight for KL divergence (beta-VAE)
+        dynamics_weight: Weight for dynamics loss
+    """
+    # 1. RECONSTRUCTION LOSS
+    # Mean over all dimensions instead of sum (more stable scaling)
+    recon_loss = F.mse_loss(recon_x, x, reduction='mean')
+    
+    # 2. KL DIVERGENCE
+    # Measures how far posterior q(z|x) is from prior p(z) = N(0,1)
+    # Formula: -0.5 * sum(1 + logvar - mu^2 - exp(logvar))
+    kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+    
+    # 3. DYNAMICS LOSS  
+    dynamics_loss, dynamics_diag = dynamics_encouraging_loss(mu_sequence)
+    
+    # COMBINE
+    total_loss = recon_loss + beta * kl_loss + dynamics_weight * dynamics_loss
+    
+    return total_loss, {
+        'recon_loss': recon_loss.item(),
+        'kl_loss': kl_loss.item(),
+        'dynamics_loss': dynamics_loss.item(),
+        **dynamics_diag
+    }
 
 
 def split_dataset(dataset):
-    """
-    Split dataset into train and validation (80/20 split)
-    """
+    """Split dataset into train and validation (80/20 split)"""
     total_size = len(dataset)
     val_size = int(0.2 * total_size)
     train_size = total_size - val_size
@@ -83,15 +218,14 @@ def split_dataset(dataset):
     return train_indices, val_indices
 
 
-def evaluate(model, dataloader, device, mean, std, temporal_weight):
-    """
-    Evaluate model on validation set with temporal loss
-    """
+def evaluate(model, dataloader, device, mean, std, beta, dynamics_weight):
+    """Evaluate model on validation set"""
     model.eval()
     total_loss = 0
-    total_mse = 0
-    total_kld = 0
-    total_temporal = 0
+    total_recon = 0
+    total_kl = 0
+    total_dynamics = 0
+    num_batches = 0
     
     with torch.no_grad():
         for batch_seq, _ in dataloader:
@@ -111,28 +245,27 @@ def evaluate(model, dataloader, device, mean, std, temporal_weight):
             mu_sequence = mu.view(batch_size, seq_len, -1)
             
             # Compute loss
-            loss, mse, kld, temporal = temporal_vae_loss(
-                recon_x, x, mu, logvar, mu_sequence, temporal_weight
+            loss, diagnostics = vae_loss_with_dynamics(
+                recon_x, x, mu, logvar, mu_sequence, beta, dynamics_weight
             )
             
-            total_loss += loss
-            total_mse += mse
-            total_kld += kld
-            total_temporal += temporal
+            total_loss += loss.item()
+            total_recon += diagnostics['recon_loss']
+            total_kl += diagnostics['kl_loss']
+            total_dynamics += diagnostics['dynamics_loss']
+            num_batches += 1
     
-    # Average over all samples
-    num_samples = len(dataloader.dataset) * 13  # 13 timesteps per sequence
-    avg_loss = total_loss / num_samples
-    avg_mse = total_mse / num_samples
-    avg_kld = total_kld / num_samples
-    avg_temporal = total_temporal / num_samples
-    
-    return avg_loss, avg_mse, avg_kld, avg_temporal
+    return {
+        'loss': total_loss / num_batches,
+        'recon': total_recon / num_batches,
+        'kl': total_kl / num_batches,
+        'dynamics': total_dynamics / num_batches
+    }
 
 
-def train_temporal_vae(config=None):
+def train_dynamics_vae(config=None):
     """
-    Train VAE with temporal loss
+    Train VAE with dynamics-encouraging loss.
     """
     if config is None:
         config = {}
@@ -141,28 +274,30 @@ def train_temporal_vae(config=None):
     epochs = config.get('epochs', EPOCHS)
     lr = config.get('lr', LEARNING_RATE)
     latent_dim = config.get('latent_dim', LATENT_DIM)
-    temporal_weight = config.get('temporal_weight', TEMPORAL_WEIGHT)
+    beta = config.get('beta', BETA)
+    dynamics_weight = config.get('dynamics_weight', DYNAMICS_WEIGHT)
     device = config.get('device', DEVICE)
     
     # Setup save paths
-    save_dir = "checkpoints/vae"
-    os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(SAVE_DIR, exist_ok=True)
     
-    save_path = os.path.join(save_dir, f"vae_temporal_latent{latent_dim}.pth")
-    best_model_path = os.path.join(save_dir, f"vae_temporal_latent{latent_dim}_best.pth")
-    stats_path = os.path.join(save_dir, f"vae_norm_stats_latent{latent_dim}.npy")
+    save_path = os.path.join(SAVE_DIR, f"vae_dynamics_latent{latent_dim}.pth")
+    best_model_path = os.path.join(SAVE_DIR, f"vae_dynamics_latent{latent_dim}_best.pth")
+    stats_path = os.path.join(SAVE_DIR, f"vae_norm_stats_dynamics_latent{latent_dim}.npy")
     
     print(f"\n{'='*60}")
-    print(f"Training Temporal VAE")
+    print(f"Training Dynamics-Encouraging VAE")
     print(f"{'='*60}")
-    print(f"Latent Dim: {latent_dim}")
-    print(f"Temporal Weight: {temporal_weight}")
+    print(f"Architecture: ImprovedVAE (256 -> 128 -> 64 -> {latent_dim})")
+    print(f"Beta (KL weight): {beta}")
+    print(f"Dynamics weight: {dynamics_weight}")
+    print(f"Min velocity target: {MIN_VELOCITY}")
     print(f"Device: {device}")
     print(f"{'='*60}\n")
     
     # 1. Load dataset
     print("Loading dataset...")
-    full_dataset = BCIDataset("data/processed/train")
+    full_dataset = BCIDataset("data/processed/train", sequence_length=SEQUENCE_LENGTH)
     print(f"[OK] Dataset loaded: {len(full_dataset)} sequences\n")
     
     # 2. Split train/val
@@ -178,53 +313,72 @@ def train_temporal_vae(config=None):
     
     # 3. Calculate normalization stats
     print("Calculating normalization stats...")
-    all_train_data = []
-    for batch_seq, _ in train_loader:
-        all_train_data.append(batch_seq.view(-1, INPUT_DIM))
-    
-    all_train_data = torch.cat(all_train_data, dim=0)
-    train_mean = all_train_data.mean(dim=0)
-    train_std = all_train_data.std(dim=0)
-    train_std[train_std < 1e-8] = 1.0
-    
-    # Save stats
-    norm_stats = {
-        'mean': train_mean.cpu().numpy(),
-        'std': train_std.cpu().numpy()
-    }
-    np.save(stats_path, norm_stats)
-    print(f"[OK] Stats saved to {stats_path}\n")
+    if os.path.exists(stats_path):
+        print(f"Loading existing stats from {stats_path}")
+        norm_stats = np.load(stats_path, allow_pickle=True).item()
+        train_mean = torch.tensor(norm_stats['mean'])
+        train_std = torch.tensor(norm_stats['std'])
+    else:
+        print("Computing stats from training data...")
+        all_train_data = []
+        for batch_seq, _ in train_loader:
+            all_train_data.append(batch_seq.view(-1, INPUT_DIM))
+        
+        all_train_data = torch.cat(all_train_data, dim=0)
+        train_mean = all_train_data.mean(dim=0)
+        train_std = all_train_data.std(dim=0)
+        train_std[train_std < 1e-8] = 1.0
+        
+        # Save stats
+        norm_stats = {
+            'mean': train_mean.cpu().numpy(),
+            'std': train_std.cpu().numpy()
+        }
+        np.save(stats_path, norm_stats)
+        print(f"[OK] Stats saved to {stats_path}\n")
     
     train_mean = train_mean.to(device)
     train_std = train_std.to(device)
     
     # 4. Create model
-    print("Creating VAE model...")
-    model = VAE(input_dim=INPUT_DIM, latent_dim=latent_dim).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=50
-    )
+    print("Creating ImprovedVAE model...")
+    model = ImprovedVAE(
+        input_dim=INPUT_DIM,
+        latent_dim=latent_dim,
+        hidden_dims=[256, 128, 64],  # Deeper architecture
+        dropout=0.1
+    ).to(device)
     
     total_params = sum(p.numel() for p in model.parameters())
     print(f"[OK] Model created with {total_params:,} parameters\n")
+    
+    # Optimizer with weight decay for regularization
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+    
+    # Cosine annealing scheduler for smooth learning rate decay
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     
     # 5. Training loop
     print("Starting training...\n")
     best_val_loss = float('inf')
     patience = 0
-    max_patience = 100
+    max_patience = 30
+    
+    # Track metrics for analysis
+    history = {
+        'train_loss': [], 'val_loss': [],
+        'mean_velocity': [], 'recon_loss': []
+    }
     
     for epoch in range(epochs):
         # Training
         model.train()
-        train_loss = 0
-        train_mse = 0
-        train_kld = 0
-        train_temporal = 0
+        train_metrics = {'loss': 0, 'recon': 0, 'kl': 0, 'dynamics': 0, 'velocity': 0}
+        num_batches = 0
         
-        for batch_seq, _ in train_loader:
-            batch_size, seq_len, feat_dim = batch_seq.shape
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False)
+        for batch_seq, _ in pbar:
+            batch_size_actual, seq_len, feat_dim = batch_seq.shape
             batch_seq = batch_seq.to(device)
             
             # Normalize
@@ -238,11 +392,11 @@ def train_temporal_vae(config=None):
             recon_x, mu, logvar = model(x)
             
             # Reshape mu for temporal loss
-            mu_sequence = mu.view(batch_size, seq_len, -1)
+            mu_sequence = mu.view(batch_size_actual, seq_len, -1)
             
-            # Compute temporal-aware loss
-            loss, mse, kld, temporal = temporal_vae_loss(
-                recon_x, x, mu, logvar, mu_sequence, temporal_weight
+            # Compute loss
+            loss, diagnostics = vae_loss_with_dynamics(
+                recon_x, x, mu, logvar, mu_sequence, beta, dynamics_weight
             )
             
             # Backprop
@@ -250,41 +404,52 @@ def train_temporal_vae(config=None):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             
-            train_loss += loss.item()
-            train_mse += mse
-            train_kld += kld
-            train_temporal += temporal
+            # Track metrics
+            train_metrics['loss'] += loss.item()
+            train_metrics['recon'] += diagnostics['recon_loss']
+            train_metrics['kl'] += diagnostics['kl_loss']
+            train_metrics['dynamics'] += diagnostics['dynamics_loss']
+            train_metrics['velocity'] += diagnostics['mean_velocity']
+            num_batches += 1
+            
+            # Update progress bar
+            pbar.set_postfix({
+                'loss': f"{loss.item():.4f}",
+                'vel': f"{diagnostics['mean_velocity']:.4f}"
+            })
         
-        # Average training loss
-        num_train_samples = len(train_dataset) * 13
-        avg_train_loss = train_loss / num_train_samples
-        avg_train_mse = train_mse / num_train_samples
-        avg_train_kld = train_kld / num_train_samples
-        avg_train_temporal = train_temporal / num_train_samples
+        # Average training metrics
+        for k in train_metrics:
+            train_metrics[k] /= num_batches
         
         # Validation
-        val_loss, val_mse, val_kld, val_temporal = evaluate(
-            model, val_loader, device, train_mean, train_std, temporal_weight
-        )
+        val_metrics = evaluate(model, val_loader, device, train_mean, train_std, beta, dynamics_weight)
         
         # Scheduler
-        scheduler.step(val_loss)
+        scheduler.step()
+        
+        # Track history
+        history['train_loss'].append(train_metrics['loss'])
+        history['val_loss'].append(val_metrics['loss'])
+        history['mean_velocity'].append(train_metrics['velocity'])
+        history['recon_loss'].append(train_metrics['recon'])
         
         # Save best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_metrics['loss'] < best_val_loss:
+            best_val_loss = val_metrics['loss']
             torch.save(model.state_dict(), best_model_path)
             patience = 0
         else:
             patience += 1
         
         # Print progress
-        if (epoch + 1) % 10 == 0 or epoch < 5:
+        if (epoch + 1) % 5 == 0 or epoch < 3:
             print(f"Epoch {epoch+1:3d}/{epochs} | "
-                  f"Train: {avg_train_loss:.4f} | "
-                  f"Val: {val_loss:.4f} | "
-                  f"Best: {best_val_loss:.4f} | "
-                  f"Temporal: {val_temporal:.4f}")
+                  f"TrLoss: {train_metrics['loss']:.4f} | "
+                  f"VaLoss: {val_metrics['loss']:.4f} | "
+                  f"Recon: {train_metrics['recon']:.4f} | "
+                  f"Vel: {train_metrics['velocity']:.4f} | "
+                  f"LR: {scheduler.get_last_lr()[0]:.2e}")
         
         # Early stopping
         if patience >= max_patience:
@@ -293,10 +458,12 @@ def train_temporal_vae(config=None):
     
     # 6. Save final model
     torch.save(model.state_dict(), save_path)
+    np.save(os.path.join(SAVE_DIR, f"training_history_dynamics_{latent_dim}.npy"), history)
     
     print(f"\n{'='*60}")
     print(f"[OK] Training Complete!")
     print(f"Best Validation Loss: {best_val_loss:.4f}")
+    print(f"Final Mean Velocity: {history['mean_velocity'][-1]:.4f}")
     print(f"Model saved to: {best_model_path}")
     print(f"{'='*60}\n")
     
@@ -304,4 +471,4 @@ def train_temporal_vae(config=None):
 
 
 if __name__ == "__main__":
-    train_temporal_vae()
+    train_dynamics_vae()

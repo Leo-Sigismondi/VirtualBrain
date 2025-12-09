@@ -17,6 +17,7 @@ ENV/
 data/raw/
 data/processed/
 data/
+!src/data/
 
 # Model checkpoints
 checkpoints/
@@ -38,4 +39,6 @@ Thumbs.db
 # Logs
 *.log
 wandb/
+
+*.pdf
 

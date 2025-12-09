@@ -23,6 +23,7 @@ CHECKPOINT_PATH = "checkpoints/vae/vae_temporal_latent32_best.pth"  # Use best m
 LATENT_DIM = 32 # Match your training config
 INPUT_DIM = 253
 N_CHANNELS = 22  # Calculated from 253 -> 22*23/2 = 253
+SEQUENCE_LENGTH = 64
 
 def visualize_reconstruction():
     """
@@ -32,7 +33,7 @@ def visualize_reconstruction():
     
     # 1. Load Data
     print("Loading dataset...")
-    ds = BCIDataset("data/processed/train")
+    ds = BCIDataset("data/processed/train", sequence_length=SEQUENCE_LENGTH)
     dl = DataLoader(ds, batch_size=1, shuffle=True)
     
     # 2. Load Model
@@ -122,7 +123,7 @@ def compare_latent_dims():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     # Load data
-    ds = BCIDataset("data/processed/train")
+    ds = BCIDataset("data/processed/train", sequence_length=SEQUENCE_LENGTH)
     dl = DataLoader(ds, batch_size=1, shuffle=True)
     seq_vectors, _ = next(iter(dl))
     original_vec = seq_vectors[0, 0, :].to(device)
@@ -185,7 +186,7 @@ def visualize_latent_dynamics():
     print("="*60)
     
     # 1. Load Data
-    ds = BCIDataset("data/processed/train")
+    ds = BCIDataset("data/processed/train", sequence_length=SEQUENCE_LENGTH)
     dl = DataLoader(ds, batch_size=1, shuffle=True)
     
     # 2. Load Model

@@ -17,27 +17,30 @@ import matplotlib.pyplot as plt
 import numpy as np
 from src.data.dataset import BCIDataset
 from torch.utils.data import DataLoader
-from src.models.vae import VAE
+from src.models.vae import ImprovedVAE
 from src.models.gru import TemporalGRU
 
 # Force unbuffered output
 sys.stdout.reconfigure(encoding='utf-8')
 
 # --- CONFIG ---
-VAE_PATH = "checkpoints/vae/vae_temporal_latent32_best.pth"
-GRU_PATH = "checkpoints/gru/gru_autoregressive_L32_H128_2L_best.pth"
+VAE_PATH = "checkpoints/vae/vae_dynamics_latent32_best.pth"
+GRU_PATH = "checkpoints/gru/gru_multistep_L32_H128_2L_best.pth"
+VAE_STATS_PATH = "checkpoints/vae/vae_norm_stats_dynamics_latent32.npy"
+LATENT_STATS_PATH = "checkpoints/gru/latent_norm_stats_multistep.npy"
 LATENT_DIM = 32
 HIDDEN_DIM = 128
 INPUT_DIM = 253
 NUM_LAYERS = 2
+SEQUENCE_LENGTH = 64
 
 
 def load_models(device):
     """Load VAE and GRU models"""
     print("Loading models...")
     
-    # Load VAE
-    vae = VAE(input_dim=INPUT_DIM, latent_dim=LATENT_DIM).to(device)
+    # Load ImprovedVAE
+    vae = ImprovedVAE(input_dim=INPUT_DIM, latent_dim=LATENT_DIM, hidden_dims=[256, 128, 64]).to(device)
     vae.load_state_dict(torch.load(VAE_PATH, map_location=device))
     vae.eval()
     
@@ -89,7 +92,7 @@ def visualize_one_step_predictions():
     
     # Load data
     print("Loading dataset...")
-    dataset = BCIDataset("data/processed/train")
+    dataset = BCIDataset("data/processed/train", sequence_length=SEQUENCE_LENGTH)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
     seq_vectors, _ = next(iter(dataloader))
     seq_vectors = seq_vectors[0].to(device)
@@ -214,18 +217,18 @@ def visualize_autoregressive_rollout():
     
     # Load data
     print("Loading dataset...")
-    dataset = BCIDataset("data/processed/train")
+    dataset = BCIDataset("data/processed/train", sequence_length=SEQUENCE_LENGTH)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
     seq_vectors, _ = next(iter(dataloader))
     seq_vectors = seq_vectors[0].to(device)
     print(f"✓ Sequence loaded: {seq_vectors.shape}\n")
     
     # Load normalization stats
-    vae_norm_stats = np.load("checkpoints/vae/vae_norm_stats_latent32.npy", allow_pickle=True).item()
+    vae_norm_stats = np.load(VAE_STATS_PATH, allow_pickle=True).item()
     vae_mean = torch.tensor(vae_norm_stats['mean']).to(device)
     vae_std = torch.tensor(vae_norm_stats['std']).to(device)
     
-    latent_stats = np.load("checkpoints/gru/latent_norm_stats_autoregressive.npy", allow_pickle=True).item()
+    latent_stats = np.load(LATENT_STATS_PATH, allow_pickle=True).item()
     latent_mean = torch.tensor(latent_stats['mean']).to(device)
     latent_std = torch.tensor(latent_stats['std']).to(device)
     
@@ -236,22 +239,26 @@ def visualize_autoregressive_rollout():
     seq_len = latent_seq_norm.shape[1]
     print(f"✓ Encoded: {latent_seq_norm.shape}\n")
     
-    # Use first 2 states, predict the rest autoregressively
-    num_seed = 2
+    # Use first N states as seed, predict the rest autoregressively
+    # Using 16 seed steps gives the GRU more context to build hidden state
+    # (Training uses step 0, so 16 is more generous but fairer for visualization)
+    num_seed = 16
     num_predict = seq_len - num_seed
     
     print(f"Autoregressive rollout: Given first {num_seed} states, predict next {num_predict} states...")
     with torch.no_grad():
-        # Start with first state
+        # Build up hidden state using seed states
         predictions = []
         hidden = None
-        current = latent_seq_norm[:, 0:1, :]
-        predictions.append(current)
         
-        # Process second state to build up hidden state
-        if num_seed > 1:
-            current, hidden = gru.predict_next(current, hidden)
-            predictions.append(current)
+        # Process seed states to build hidden state
+        for t in range(num_seed):
+            current = latent_seq_norm[:, t:t+1, :]
+            predictions.append(current)  # Keep ground truth for seed
+            _, hidden = gru.predict_next(current, hidden)  # Build hidden state
+        
+        # Continue from last seed state
+        current = latent_seq_norm[:, num_seed-1:num_seed, :]
         
         # Autoregressive rollout
         for step in range(num_predict):
@@ -263,16 +270,36 @@ def visualize_autoregressive_rollout():
     
     ground_truth = latent_seq_norm[0].cpu().numpy()
     
-    # Calculate error for predicted portion
+    # Calculate error for predicted portion (after seed)
     predicted_portion = predicted_trajectory[num_seed:]
     gt_portion = ground_truth[num_seed:]
     errors = np.abs(predicted_portion - gt_portion)
     error_per_step = errors.mean(axis=1)
     
-    # Naive baseline: persistence (z[t+1] = z[t])
-    naive_predictions = ground_truth[num_seed-1:-1]  # Shift by 1
+    # FAIR Naive baseline: also autoregressive from seed
+    # Naive predicts z[t+1] = z[t], starting from the SAME seed point
+    naive_predictions = np.zeros((num_predict, LATENT_DIM))
+    naive_current = ground_truth[num_seed - 1]  # Start from last seed state
+    for t in range(num_predict):
+        naive_predictions[t] = naive_current
+        # Naive would update: naive_current stays the same (persistence)
+        # But for TRUE autoregressive: naive_current = naive_predictions[t]
+    
     naive_errors = np.abs(gt_portion - naive_predictions)
     naive_error_per_step = naive_errors.mean(axis=1)
+
+    # FAIR Momentum baseline: z[t+1] = 2*z[t] - z[t-1], also from seed
+    momentum_predictions = np.zeros((num_predict, LATENT_DIM))
+    momentum_prev = ground_truth[num_seed - 2]  # z[t-1]
+    momentum_current = ground_truth[num_seed - 1]  # z[t]
+    for t in range(num_predict):
+        momentum_predictions[t] = 2 * momentum_current - momentum_prev
+        # Update for next step (autoregressive)
+        momentum_prev = momentum_current
+        momentum_current = momentum_predictions[t]
+    
+    momentum_errors = np.abs(gt_portion - momentum_predictions)
+    momentum_error_per_step = momentum_errors.mean(axis=1)
     
     # Visualize
     fig, axes = plt.subplots(2, 2, figsize=(16, 10))
@@ -302,6 +329,8 @@ def visualize_autoregressive_rollout():
             label='GRU', markersize=8, linewidth=2)
     ax.plot(pred_timesteps, naive_error_per_step, 's--', color='gray', 
             label='Naive Baseline', markersize=6, linewidth=2, alpha=0.7)
+    ax.plot(pred_timesteps, momentum_error_per_step, '^:', color='blue', 
+            label='Momentum Baseline', markersize=6, linewidth=2, alpha=0.7)
     ax.set_xlabel('Timestep', fontsize=11)
     ax.set_ylabel('Mean Absolute Error', fontsize=11)
     ax.set_title(f'Error Accumulation Over Rollout\n(GRU vs Baseline)', 
@@ -313,10 +342,14 @@ def visualize_autoregressive_rollout():
     ax = axes[1, 0]
     cumulative_gru = np.cumsum(error_per_step)
     cumulative_naive = np.cumsum(naive_error_per_step)
+    cumulative_momentum = np.cumsum(momentum_error_per_step)
+
     ax.plot(pred_timesteps, cumulative_gru, 'o-', color='red', 
             label='GRU', markersize=8, linewidth=2)
     ax.plot(pred_timesteps, cumulative_naive, 's--', color='gray', 
             label='Naive Baseline', markersize=6, linewidth=2, alpha=0.7)
+    ax.plot(pred_timesteps, cumulative_momentum, '^:', color='blue', 
+            label='Momentum Baseline', markersize=6, linewidth=2, alpha=0.7)
     ax.set_xlabel('Timestep', fontsize=11)
     ax.set_ylabel('Cumulative Error', fontsize=11)
     ax.set_title('Cumulative Error Over Time', fontsize=12, fontweight='bold')
@@ -327,10 +360,11 @@ def visualize_autoregressive_rollout():
     ax = axes[1, 1]
     gru_mae = errors.mean()
     naive_mae = naive_errors.mean()
+    momentum_mae = momentum_errors.mean()
     
-    bars = ax.bar(['GRU\nAutoregressive', 'Naive\nPersistence'], 
-                  [gru_mae, naive_mae], 
-                  color=['coral', 'lightgray'], alpha=0.8, edgecolor='black', linewidth=2)
+    bars = ax.bar(['GRU', 'Naive', 'Momentum'], 
+                  [gru_mae, naive_mae, momentum_mae], 
+                  color=['coral', 'lightgray', 'lightblue'], alpha=0.8, edgecolor='black', linewidth=2)
     
     # Add values on bars
     for bar in bars:
@@ -358,9 +392,11 @@ def visualize_autoregressive_rollout():
     print("Autoregressive Rollout Quality:")
     print(f"  GRU MAE: {gru_mae:.6f}")
     print(f"  Naive MAE: {naive_mae:.6f}")
+    print(f"  Momentum MAE: {momentum_mae:.6f}")
     print(f"  Improvement: {improvement:.2f}%")
     print(f"  Final step error (GRU): {error_per_step[-1]:.6f}")
-    print(f"  Final step error (Naive): {naive_error_per_step[-1]:.6f}\n")
+    print(f"  Final step error (Naive): {naive_error_per_step[-1]:.6f}")
+    print(f"  Final step error (Momentum): {momentum_error_per_step[-1]:.6f}\n")
     
     plt.show()
     return gru_mae, naive_mae
@@ -381,7 +417,7 @@ def evaluate_full_dataset():
     
     # Load data
     print("Loading full dataset...")
-    dataset = BCIDataset("data/processed/train")
+    dataset = BCIDataset("data/processed/train", sequence_length=SEQUENCE_LENGTH)
     dataloader = DataLoader(dataset, batch_size=64, shuffle=False)
     print(f"✓ Dataset loaded: {len(dataset)} sequences\n")
     
@@ -421,8 +457,9 @@ def evaluate_full_dataset():
     latent_normalized = (latent_sequences - latent_mean) / (latent_std + 1e-8)
     print(f"✓ Encoded: {latent_normalized.shape}\n")
     
-    # Evaluate autoregressive prediction
-    print("Evaluating autoregressive predictions...")
+    # Evaluate ONE-STEP prediction (FAIR comparison)
+    # Both GRU and naive receive ground truth at each step
+    print("Evaluating one-step predictions (fair comparison)...")
     total_gru_error = 0
     total_naive_error = 0
     total_elements = 0
@@ -433,15 +470,14 @@ def evaluate_full_dataset():
             batch = latent_normalized[i:i+batch_size].to(device)
             b_size, seq_len = batch.shape[0], batch.shape[1]
             
-            # Autoregressive prediction
+            # GRU one-step prediction (use ground truth at each step)
             predictions = []
             hidden = None
-            current = batch[:, 0:1, :]
             
             for t in range(seq_len - 1):
+                current = batch[:, t:t+1, :]
                 next_state, hidden = gru.predict_next(current, hidden)
                 predictions.append(next_state)
-                current = next_state
             
             pred_seq = torch.cat(predictions, dim=1)
             
@@ -450,7 +486,7 @@ def evaluate_full_dataset():
             gru_error = F.l1_loss(pred_seq, target, reduction='sum')
             total_gru_error += gru_error.item()
             
-            # Naive error (persistence)
+            # Naive error (persistence) - also uses ground truth at each step
             naive_pred = batch[:, :-1, :]
             naive_error = F.l1_loss(naive_pred, target, reduction='sum')
             total_naive_error += naive_error.item()
@@ -461,10 +497,10 @@ def evaluate_full_dataset():
     naive_mae = total_naive_error / total_elements
     improvement = (naive_mae - gru_mae) / naive_mae * 100
     
-    print("\n" + "="*60)
-    print("RESULTS")
+    print("\\n" + "="*60)
+    print("RESULTS (One-Step Prediction - Fair Comparison)")
     print("="*60)
-    print(f"GRU MAE (autoregressive): {gru_mae:.6f}")
+    print(f"GRU MAE (one-step): {gru_mae:.6f}")
     print(f"Naive Baseline MAE: {naive_mae:.6f}")
     print(f"Improvement: {improvement:.2f}%")
     
@@ -473,7 +509,7 @@ def evaluate_full_dataset():
     else:
         print("❌ WARNING: GRU does not beat baseline")
     
-    print("="*60 + "\n")
+    print("="*60 + "\\n")
     
     return gru_mae, naive_mae
 
