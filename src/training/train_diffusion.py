@@ -24,6 +24,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.models.diffusion import TangentDiffusion
+from src.models.vae import ImprovedVAE
 from src.data.dataset import BCIDataset
 from src.preprocessing.geometry_utils import (
     validate_spd, exp_euclidean_map, vec_to_sym_matrix
@@ -44,9 +45,11 @@ DIFFUSION_STEPS = 1000
 DIFFUSION_HIDDEN_DIM = 512  # Larger for 253-dim input
 SCHEDULE = 'cosine'  # 'linear' or 'cosine'
 
-# Conditioning - we can condition on nothing (unconditional) or on class labels
-# For now, we'll train unconditionally as a generative prior
-CONDITION_DIM = 0  # 0 = unconditional
+# Conditioning - condition on VAE latent vectors (32-dim)
+# At inference, GRU-predicted latents will be used as conditions
+CONDITION_DIM = 32  # VAE latent dimension
+VAE_PATH = "checkpoints/vae/vae_dynamics_latent32.pth"
+VAE_LATENT_DIM = 32
 
 # Training config
 BATCH_SIZE = 32  # Smaller due to larger model
@@ -64,13 +67,14 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # Training Functions
 # =============================================================================
 
-def train_epoch(diffusion, dataloader, optimizer, device, epoch, total_epochs):
+def train_epoch(diffusion, vae, dataloader, optimizer, device, epoch, total_epochs):
     """
-    Train diffusion model for one epoch.
+    Train diffusion model for one epoch with VAE latent conditioning.
     
-    The model learns to denoise tangent-space trajectories directly.
+    The model learns to generate tangent-space vectors conditioned on VAE latents.
     """
     diffusion.train()
+    vae.eval()  # VAE is frozen, only used for encoding
     total_loss = 0
     num_batches = 0
     
@@ -79,10 +83,22 @@ def train_epoch(diffusion, dataloader, optimizer, device, epoch, total_epochs):
     for batch in pbar:
         sequences = batch[0].to(device)  # (B, T, D) already in tangent space!
         
+        # Encode tangent sequences to get latent conditions
+        # Reshape for VAE: (B*T, D) -> encode -> (B*T, latent_dim)
+        batch_size, seq_len, input_dim = sequences.shape
+        flat_sequences = sequences.view(-1, input_dim)  # (B*T, 253)
+        
+        with torch.no_grad():
+            latent_mu, latent_logvar = vae.encode(flat_sequences)  # (B*T, 32)
+            # Use mean (no sampling during training for stability)
+            latent_conditions = latent_mu.view(batch_size, seq_len, -1)  # (B, T, 32)
+            # Average over time for a single condition per sequence
+            condition = latent_conditions.mean(dim=1)  # (B, 32)
+        
         optimizer.zero_grad()
         
-        # Diffusion training loss (unconditional)
-        loss = diffusion.training_loss(sequences, condition=None)
+        # Diffusion training loss with VAE latent condition
+        loss = diffusion.training_loss(sequences, condition=condition)
         
         loss.backward()
         torch.nn.utils.clip_grad_norm_(diffusion.parameters(), max_norm=1.0)
@@ -97,11 +113,12 @@ def train_epoch(diffusion, dataloader, optimizer, device, epoch, total_epochs):
 
 
 @torch.no_grad()
-def evaluate(diffusion, dataloader, device, num_batches=10):
+def evaluate(diffusion, vae, dataloader, device, num_batches=10):
     """
-    Evaluate diffusion model by computing validation loss.
+    Evaluate diffusion model by computing validation loss with VAE conditioning.
     """
     diffusion.eval()
+    vae.eval()
     total_loss = 0
     count = 0
     
@@ -109,7 +126,15 @@ def evaluate(diffusion, dataloader, device, num_batches=10):
         if i >= num_batches:
             break
         sequences = batch[0].to(device)
-        loss = diffusion.training_loss(sequences, condition=None)
+        
+        # Encode for condition
+        batch_size, seq_len, input_dim = sequences.shape
+        flat_sequences = sequences.view(-1, input_dim)
+        latent_mu, _ = vae.encode(flat_sequences)
+        latent_conditions = latent_mu.view(batch_size, seq_len, -1)
+        condition = latent_conditions.mean(dim=1)
+        
+        loss = diffusion.training_loss(sequences, condition=condition)
         total_loss += loss.item()
         count += 1
     
@@ -121,14 +146,19 @@ def validate_spd_samples(diffusion, device, num_samples=10, seq_len=64):
     """
     Generate samples and validate they produce valid SPD matrices.
     
+    Uses random latent vectors as conditions to simulate GRU outputs.
     End-to-end test: sample tangent vectors → reshape → exp() → SPD
     """
     diffusion.eval()
     
-    # Generate samples in tangent space
+    # Use random latent vectors as conditions (simulating expected GRU output range)
+    # Normal distribution since VAE encoder produces roughly standard normal latents
+    random_conditions = torch.randn(num_samples, CONDITION_DIM, device=device)
+    
+    # Generate samples in tangent space with conditioning
     samples = diffusion.sample_ddim(
         (num_samples, seq_len, INPUT_DIM), 
-        condition=None,
+        condition=random_conditions,
         device=device, 
         steps=50
     )
@@ -182,7 +212,7 @@ def train_diffusion(config=None):
     print(f"Diffusion Steps: {DIFFUSION_STEPS}")
     print(f"Schedule: {SCHEDULE}")
     print(f"Hidden Dim: {DIFFUSION_HIDDEN_DIM}")
-    print(f"Conditioning: {'None (unconditional)' if CONDITION_DIM == 0 else CONDITION_DIM}")
+    print(f"Conditioning: VAE latent ({CONDITION_DIM}-dim)")
     print(f"Device: {device}")
     print(f"{'='*60}\n")
     
@@ -253,12 +283,21 @@ def train_diffusion(config=None):
     print(f"[OK] Train: {len(train_dataset)} sequences")
     print(f"[OK] Val: {len(val_dataset)} sequences\n")
     
-    # 2. Create diffusion model
+    # 2. Load pre-trained VAE for conditioning
+    print(f"Loading pre-trained VAE from {VAE_PATH}...")
+    vae = ImprovedVAE(input_dim=INPUT_DIM, latent_dim=VAE_LATENT_DIM).to(device)
+    vae.load_state_dict(torch.load(VAE_PATH, map_location=device))
+    vae.eval()
+    for param in vae.parameters():
+        param.requires_grad = False  # Freeze VAE
+    print(f"[OK] VAE loaded (latent_dim={VAE_LATENT_DIM})\n")
+    
+    # 3. Create diffusion model
     print("Creating diffusion model...")
     diffusion = TangentDiffusion(
         tangent_dim=INPUT_DIM,
         hidden_dim=DIFFUSION_HIDDEN_DIM,
-        condition_dim=128 if CONDITION_DIM > 0 else 128,  # Still need condition_dim for architecture
+        condition_dim=CONDITION_DIM,  # Now using 32-dim VAE latent
         n_steps=DIFFUSION_STEPS,
         schedule=SCHEDULE
     ).to(device)
@@ -270,7 +309,7 @@ def train_diffusion(config=None):
     optimizer = optim.AdamW(diffusion.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     
-    # 3. Training loop
+    # 4. Training loop
     print("Starting training...\n")
     best_val_loss = float('inf')
     patience = 0
@@ -281,12 +320,12 @@ def train_diffusion(config=None):
     for epoch in range(epochs):
         # Train
         train_loss = train_epoch(
-            diffusion, train_loader, 
+            diffusion, vae, train_loader, 
             optimizer, device, epoch, epochs
         )
         
         # Evaluate
-        val_loss = evaluate(diffusion, val_loader, device)
+        val_loss = evaluate(diffusion, vae, val_loader, device)
         
         # SPD validation on small sample every 10 epochs
         if epoch % 10 == 0 or epoch == epochs - 1:
