@@ -35,8 +35,8 @@ from src.preprocessing.geometry_utils import (
 # =============================================================================
 
 # Data dimensions
-INPUT_DIM = 253  # Vectorized upper triangle of 23x23 symmetric matrix
-N_CHANNELS = 23  # Number of EEG channels
+INPUT_DIM = 253  # Vectorized lower triangle (with diagonal) of 22x22 symmetric matrix: 22*23/2 = 253
+N_CHANNELS = 22  # Number of EEG channels
 SEQUENCE_LENGTH = 64
 
 # Diffusion config
@@ -139,7 +139,7 @@ def validate_spd_samples(diffusion, device, num_samples=10, seq_len=64):
     for t in range(seq_len):
         # Reshape to matrix form
         tangent_vecs = samples[:, t, :]  # (B, 253)
-        matrices = vec_to_sym_matrix(tangent_vecs, N_CHANNELS)  # (B, 23, 23)
+        matrices = vec_to_sym_matrix(tangent_vecs, N_CHANNELS)  # (B, 22, 22)
         
         # Apply exp() to ensure SPD
         spd_matrices = exp_euclidean_map(matrices)
@@ -288,9 +288,12 @@ def train_diffusion(config=None):
         # Evaluate
         val_loss = evaluate(diffusion, val_loader, device)
         
-        # SPD validation skipped during training - use evaluate_diffusion.py after
-        # (validate_spd_samples has dimension mismatch issues)
-        spd_rate, min_eigval = 1.0, 0.0
+        # SPD validation on small sample every 10 epochs
+        if epoch % 10 == 0 or epoch == epochs - 1:
+            spd_rate, min_eigval = validate_spd_samples(diffusion, device, num_samples=10)
+            print(f"         SPD Valid: {spd_rate*100:.1f}% | Min Eigval: {min_eigval:.6f}")
+        else:
+            spd_rate, min_eigval = history['spd_valid_rate'][-1] if history['spd_valid_rate'] else 1.0, 0.0
         
         scheduler.step()
         
@@ -314,9 +317,6 @@ def train_diffusion(config=None):
                   f"Val: {val_loss:.4f} | "
                   f"Best: {best_val_loss:.4f} | "
                   f"LR: {optimizer.param_groups[0]['lr']:.2e}")
-            
-            if (epoch + 1) % 10 == 0:
-                print(f"         SPD Valid: {spd_rate*100:.1f}% | Min Eigval: {min_eigval:.6f}")
         
         # Early stopping
         if patience >= max_patience:

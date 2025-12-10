@@ -17,18 +17,23 @@ def sym_matrix_to_vec(matrix):
 
 def vec_to_sym_matrix(vec, n):
     """
-    Operazione inversa: dal vettore ricostruisce la matrice simmetrica.
-    Input: (..., D) dove D = N*(N+1)/2
+    Inverse operation: reconstruct symmetric matrix from vector.
+    Input: (..., D) where D = N*(N+1)/2
     Output: (..., N, N)
+    
+    CORRECT IMPLEMENTATION: Does not double diagonal.
+    Vector contains lower triangle + diagonal.
     """
-    # Prepariamo la matrice vuota
-    # Gestisce sia singoli vettori che batch
     batch_shape = vec.shape[:-1]
     matrix = torch.zeros(*batch_shape, n, n, device=vec.device, dtype=vec.dtype)
     
+    # Fill lower triangle (including diagonal)
     rows, cols = torch.tril_indices(n, n)
     matrix[..., rows, cols] = vec
-    matrix[..., cols, rows] = vec # Simmetria
+    
+    # Make symmetric: add transpose, subtract diagonal to avoid doubling
+    # M + M.T doubles everything, so subtract diagonal once
+    matrix = matrix + matrix.transpose(-2, -1) - torch.diag_embed(matrix.diagonal(dim1=-2, dim2=-1))
     
     return matrix
 
@@ -58,12 +63,23 @@ def exp_euclidean_map(tangent_matrix):
     IMPORTANT: This guarantees the output is SPD!
     - Symmetric: by construction (U @ diag @ U.T)
     - Positive Definite: exp(eigenvalues) > 0 always
+    
+    Uses float64 for numerical stability. Output is also float64.
     """
-    eigvals, eigvecs = torch.linalg.eigh(tangent_matrix)
+    # Use float64 for numerical stability
+    tangent_matrix_64 = tangent_matrix.double()
+    
+    eigvals, eigvecs = torch.linalg.eigh(tangent_matrix_64)
     exp_eigvals = torch.exp(eigvals)
+    
+    # Clamp to ensure strictly positive (handles any remaining precision issues)
+    exp_eigvals = exp_eigvals.clamp(min=1e-15)
+    
     spd_matrix = eigvecs @ torch.diag_embed(exp_eigvals) @ eigvecs.transpose(-2, -1)
     
+    # Keep in float64 for numerical stability
     return spd_matrix
+
 
 
 # =============================================================================
@@ -91,10 +107,10 @@ def validate_spd(matrix, eps=1e-6, return_details=False):
     symmetry_error = torch.norm(matrix - matrix.transpose(-2, -1), dim=(-2, -1))
     is_symmetric = symmetry_error < eps
     
-    # Check positive definiteness via eigenvalues
-    eigvals = torch.linalg.eigvalsh(matrix)
-    min_eigval = eigvals.min(dim=-1).values
-    max_eigval = eigvals.max(dim=-1).values
+    # Check positive definiteness via eigenvalues (use float64 for precision)
+    eigvals = torch.linalg.eigvalsh(matrix.double())
+    min_eigval = eigvals.min(dim=-1).values.to(matrix.dtype)
+    max_eigval = eigvals.max(dim=-1).values.to(matrix.dtype)
     is_positive = min_eigval > eps
     
     is_valid = is_symmetric & is_positive

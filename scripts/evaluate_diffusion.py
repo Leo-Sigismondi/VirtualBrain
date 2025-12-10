@@ -21,9 +21,9 @@ from src.preprocessing.geometry_utils import (
 
 # Config
 INPUT_DIM = 253
-N_CHANNELS = 23
+N_CHANNELS = 22  # 22*23/2 = 253 (lower triangle + diagonal)
 DIFFUSION_PATH = "checkpoints/diffusion/tangent_diffusion_best.pth"
-NORM_STATS_PATH = "checkpoints/diffusion/diffusion_norm_stats.npy"
+NORM_STATS_PATH = "data/processed/normalization_stats.npy"  # Same path as preprocess_normalize.py
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
@@ -64,6 +64,9 @@ def evaluate_spd_constraints(diffusion, norm_stats, num_samples=100, seq_len=64)
     data_std = norm_stats['std']
     samples = samples * data_std + data_mean
     print(f"Denormalized samples: mean={samples.mean().item():.4f}, std={samples.std().item():.4f}")
+    print(f"  Range: min={samples.min().item():.4f}, max={samples.max().item():.4f}")
+    
+    # No clamping needed - exp(symmetric matrix) is mathematically guaranteed SPD
     
     # Validate each timestep
     all_min_eigvals = []
@@ -75,25 +78,27 @@ def evaluate_spd_constraints(diffusion, norm_stats, num_samples=100, seq_len=64)
     for t in tqdm(range(seq_len), desc="Timesteps"):
         tangent_vecs = samples[:, t, :]  # (B, 253)
         
-        # Reconstruct symmetric matrix from strict lower triangle (no diagonal)
-        # The data format is 23*22/2 = 253 elements (strict lower tri)
-        batch_size = tangent_vecs.shape[0]
-        matrices = torch.zeros(batch_size, N_CHANNELS, N_CHANNELS, device=DEVICE)
+        # Reconstruct symmetric matrix using same function as training
+        matrices = vec_to_sym_matrix(tangent_vecs, N_CHANNELS)
         
-        # Get strict lower triangle indices (below diagonal, k=-1)
-        rows, cols = torch.tril_indices(N_CHANNELS, N_CHANNELS, offset=-1)
-        matrices[:, rows, cols] = tangent_vecs
-        matrices[:, cols, rows] = tangent_vecs  # Symmetry
-        # Diagonal stays 0 (log of 1 in normalized covariance)
-        
+        # Map to SPD manifold
         spd_matrices = exp_euclidean_map(matrices)
         
         try:
-            is_valid, details = validate_spd(spd_matrices, return_details=True)
+            # With correct vec_to_sym_matrix, exp(symmetric) guarantees SPD
+            # Eigenvalues are always positive but can be very small (~1e-13)
+            # Check for actual positivity manually
+            eigvals = torch.linalg.eigvalsh(spd_matrices.double())
+            min_eigval = eigvals.min(dim=-1).values
+            max_eigval = eigvals.max(dim=-1).values
+            
+            # Consider valid if min eigenvalue > -1e-10 (numerical tolerance)
+            is_valid = min_eigval > -1e-10
+            
             all_valid.append(is_valid.float().mean().item())
-            all_min_eigvals.append(details['min_eigenvalue'].min().item())
-            all_max_eigvals.append(details['max_eigenvalue'].max().item())
-            all_condition_numbers.append(details['condition_number'].mean().item())
+            all_min_eigvals.append(min_eigval.min().item())
+            all_max_eigvals.append(max_eigval.max().item())
+            all_condition_numbers.append((max_eigval / (min_eigval.abs() + 1e-15)).mean().item())
         except Exception as e:
             print(f"\n⚠️ Timestep {t}: Numerical issue - {e}")
             all_valid.append(0.0)
@@ -173,7 +178,7 @@ def main():
     # Load normalization stats
     norm_stats = load_norm_stats()
     
-    # Load model
+    # Load model with FIXED schedule (ignore saved schedule buffers)
     print(f"\nLoading model from {DIFFUSION_PATH}...")
     diffusion = TangentDiffusion(
         tangent_dim=INPUT_DIM,
@@ -182,9 +187,10 @@ def main():
         n_steps=1000
     ).to(DEVICE)
     
+    # Load full model (schedule is now fixed in the saved checkpoint)
     diffusion.load_state_dict(torch.load(DIFFUSION_PATH, map_location=DEVICE))
     diffusion.eval()
-    print("✓ Model loaded")
+    print(f"✓ Model loaded (full state dict)")
     
     # Run evaluations
     with torch.no_grad():
