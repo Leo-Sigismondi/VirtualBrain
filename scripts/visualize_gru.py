@@ -26,7 +26,7 @@ sys.stdout.reconfigure(encoding='utf-8')
 # --- CONFIG ---
 VAE_PATH = "checkpoints/vae/vae_dynamics_latent32_best.pth"
 GRU_PATH = "checkpoints/gru/gru_multistep_L32_H128_2L_best.pth"
-VAE_STATS_PATH = "checkpoints/vae/vae_norm_stats_dynamics_latent32.npy"
+VAE_STATS_PATH = "data/processed/normalization_stats.npy"
 LATENT_STATS_PATH = "checkpoints/gru/latent_norm_stats_multistep.npy"
 LATENT_DIM = 32
 HIDDEN_DIM = 128
@@ -99,11 +99,11 @@ def visualize_one_step_predictions():
     print(f"✓ Sequence loaded: {seq_vectors.shape}\n")
     
     # Load normalization stats
-    vae_norm_stats = np.load("checkpoints/vae/vae_norm_stats_latent32.npy", allow_pickle=True).item()
+    vae_norm_stats = np.load(VAE_STATS_PATH, allow_pickle=True).item()
     vae_mean = torch.tensor(vae_norm_stats['mean']).to(device)
     vae_std = torch.tensor(vae_norm_stats['std']).to(device)
     
-    latent_stats = np.load("checkpoints/gru/latent_norm_stats_autoregressive.npy", allow_pickle=True).item()
+    latent_stats = np.load(LATENT_STATS_PATH, allow_pickle=True).item()
     latent_mean = torch.tensor(latent_stats['mean']).to(device)
     latent_std = torch.tensor(latent_stats['std']).to(device)
     
@@ -422,11 +422,11 @@ def evaluate_full_dataset():
     print(f"✓ Dataset loaded: {len(dataset)} sequences\n")
     
     # Load normalization stats
-    vae_norm_stats = np.load("checkpoints/vae/vae_norm_stats_latent32.npy", allow_pickle=True).item()
+    vae_norm_stats = np.load(VAE_STATS_PATH, allow_pickle=True).item()
     vae_mean = torch.tensor(vae_norm_stats['mean']).to(device)
     vae_std = torch.tensor(vae_norm_stats['std']).to(device)
     
-    latent_stats = np.load("checkpoints/gru/latent_norm_stats_autoregressive.npy", allow_pickle=True).item()
+    latent_stats = np.load(LATENT_STATS_PATH, allow_pickle=True).item()
     latent_mean = torch.tensor(latent_stats['mean']).to(device)
     latent_std = torch.tensor(latent_stats['std']).to(device)
     

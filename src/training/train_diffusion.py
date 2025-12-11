@@ -25,7 +25,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.models.diffusion import TangentDiffusion
 from src.models.vae import ImprovedVAE
-from src.data.dataset import BCIDataset
+from src.data.data_utils import (
+    get_data_loaders, load_normalized_dataset, get_normalization_stats,
+    INPUT_DIM, N_CHANNELS, SEQUENCE_LENGTH, encode_to_latent
+)
 from src.preprocessing.geometry_utils import (
     validate_spd, exp_euclidean_map, vec_to_sym_matrix
 )
@@ -35,10 +38,8 @@ from src.preprocessing.geometry_utils import (
 # Configuration
 # =============================================================================
 
-# Data dimensions
-INPUT_DIM = 253  # Vectorized lower triangle (with diagonal) of 22x22 symmetric matrix: 22*23/2 = 253
-N_CHANNELS = 22  # Number of EEG channels
-SEQUENCE_LENGTH = 64
+# Data dimensions (imported from data_utils for consistency)
+# INPUT_DIM = 253, N_CHANNELS = 22, SEQUENCE_LENGTH = 64
 
 # Diffusion config
 DIFFUSION_STEPS = 1000
@@ -80,20 +81,21 @@ def train_epoch(diffusion, vae, dataloader, optimizer, device, epoch, total_epoc
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{total_epochs}", leave=False)
     
-    for batch in pbar:
+    for batch_idx, batch in enumerate(pbar):
         sequences = batch[0].to(device)  # (B, T, D) already in tangent space!
         
         # Encode tangent sequences to get latent conditions
-        # Reshape for VAE: (B*T, D) -> encode -> (B*T, latent_dim)
         batch_size, seq_len, input_dim = sequences.shape
         flat_sequences = sequences.view(-1, input_dim)  # (B*T, 253)
         
         with torch.no_grad():
-            latent_mu, latent_logvar = vae.encode(flat_sequences)  # (B*T, 32)
-            # Use mean (no sampling during training for stability)
-            latent_conditions = latent_mu.view(batch_size, seq_len, -1)  # (B, T, 32)
+            # Only get mu (don't bother computing logvar)
+            latent_mu, _ = vae.encode(flat_sequences)  # (B*T, 32)
             # Average over time for a single condition per sequence
-            condition = latent_conditions.mean(dim=1)  # (B, 32)
+            condition = latent_mu.view(batch_size, seq_len, -1).mean(dim=1)  # (B, 32)
+        
+        # Free intermediate tensors
+        del flat_sequences, latent_mu
         
         optimizer.zero_grad()
         
@@ -108,6 +110,10 @@ def train_epoch(diffusion, vae, dataloader, optimizer, device, epoch, total_epoc
         num_batches += 1
         
         pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+        
+        # Clear CUDA cache periodically to prevent memory buildup
+        if batch_idx % 500 == 0:
+            torch.cuda.empty_cache()
     
     return total_loss / num_batches
 
@@ -131,8 +137,10 @@ def evaluate(diffusion, vae, dataloader, device, num_batches=10):
         batch_size, seq_len, input_dim = sequences.shape
         flat_sequences = sequences.view(-1, input_dim)
         latent_mu, _ = vae.encode(flat_sequences)
-        latent_conditions = latent_mu.view(batch_size, seq_len, -1)
-        condition = latent_conditions.mean(dim=1)
+        condition = latent_mu.view(batch_size, seq_len, -1).mean(dim=1)
+        
+        # Free intermediate tensors
+        del flat_sequences, latent_mu
         
         loss = diffusion.training_loss(sequences, condition=condition)
         total_loss += loss.item()
@@ -216,72 +224,11 @@ def train_diffusion(config=None):
     print(f"Device: {device}")
     print(f"{'='*60}\n")
     
-    # 1. Load dataset (already in tangent space via log-euclidean map)
-    # 1. Load pre-normalized dataset (memory-mappable)
+    # 1. Load pre-normalized dataset using shared utilities
     print("Loading pre-normalized dataset...")
-    NORM_DATA_PATH = "data/processed/train_normalized.npy"
-    if not os.path.exists(NORM_DATA_PATH):
-        raise FileNotFoundError(f"Normalized data found at {NORM_DATA_PATH}. Run scripts/preprocess_normalize.py first.")
-    
-    # Check file size to confirm shape
-    file_size = os.path.getsize(NORM_DATA_PATH)
-    item_size = np.dtype('float32').itemsize
-    expected_elements = file_size // item_size
-    
-    # Dimension check (N * 64 * 253)
-    feature_size = SEQUENCE_LENGTH * INPUT_DIM
-    num_samples = expected_elements // feature_size
-    
-    print(f"File size: {file_size/1e9:.2f} GB")
-    print(f"Computed samples: {num_samples}")
-    
-    SHAPE = (num_samples, SEQUENCE_LENGTH, INPUT_DIM)
-    
-    # Load with memmap directly
-    normalized_data = np.memmap(
-        NORM_DATA_PATH, 
-        dtype='float32', 
-        mode='r', 
-        shape=SHAPE
-    )
-    print(f"Dataset shape: {normalized_data.shape}")
-    
-    # Simple Dataset wrapper for memmap array
-    class MemmapDataset(torch.utils.data.Dataset):
-        def __init__(self, data, indices=None):
-            self.data = data
-            self.indices = indices if indices is not None else np.arange(len(data))
-            
-        def __len__(self):
-            return len(self.indices)
-            
-        def __getitem__(self, idx):
-            real_idx = self.indices[idx]
-            # Convert to tensor on the fly
-            return (torch.from_numpy(self.data[real_idx]).float(),)
-
-    # Split indices instead of data
-    total_size = len(normalized_data)
-    val_size = int(0.1 * total_size)
-    train_size = total_size - val_size
-    
-    # Use fixed seed for consistent split
-    rng = np.random.RandomState(42)
-    indices = np.arange(total_size)
-    rng.shuffle(indices)
-    
-    train_indices = indices[:train_size]
-    val_indices = indices[train_size:]
-    
-    train_dataset = MemmapDataset(normalized_data, train_indices)
-    val_dataset = MemmapDataset(normalized_data, val_indices)
-    
-    # Use more workers for faster loading if using SSD, else 0 is safer for HDD/memmap
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
-    
-    print(f"[OK] Train: {len(train_dataset)} sequences")
-    print(f"[OK] Val: {len(val_dataset)} sequences\n")
+    train_loader, val_loader, norm_stats = get_data_loaders(batch_size=BATCH_SIZE)
+    print(f"[OK] Train: {len(train_loader.dataset)} sequences")
+    print(f"[OK] Val: {len(val_loader.dataset)} sequences\n")
     
     # 2. Load pre-trained VAE for conditioning
     print(f"Loading pre-trained VAE from {VAE_PATH}...")

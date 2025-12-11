@@ -41,7 +41,10 @@ import torch
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from src.data.dataset import BCIDataset
+from src.data.data_utils import (
+    get_data_loaders, load_normalized_dataset, get_normalization_stats,
+    encode_to_latent, INPUT_DIM, SEQUENCE_LENGTH
+)
 from src.models.vae import ImprovedVAE
 from src.models.gru import TemporalGRU
 import os
@@ -49,15 +52,14 @@ import numpy as np
 from tqdm import tqdm
 
 # --- CONFIG ---
-BATCH_SIZE = 256  # Smaller batch for more updates
+BATCH_SIZE = 256
 EPOCHS = 200
 LEARNING_RATE = 5e-4
 LATENT_DIM = 32
 HIDDEN_DIM = 128
 NUM_LAYERS = 2
-DROPOUT = 0.2  # Slightly higher for regularization
-INPUT_DIM = 253
-SEQUENCE_LENGTH = 64
+DROPOUT = 0.2
+# INPUT_DIM = 253 and SEQUENCE_LENGTH = 64 imported from data_utils
 
 # Multi-step prediction horizons
 PREDICTION_HORIZONS = [1, 4, 8, 16]  # Predict at these many steps ahead
@@ -80,48 +82,7 @@ SAVE_PATH = f"{SAVE_DIR}/gru_multistep_L32_H{HIDDEN_DIM}_2L.pth"
 BEST_MODEL_PATH = f"{SAVE_DIR}/gru_multistep_L32_H{HIDDEN_DIM}_2L_best.pth"
 
 
-def encode_to_latent(vae_model, dataloader, device, norm_stats=None):
-    """
-    Encode all data to latent space using pre-trained VAE.
-    
-    Uses deterministic encoding (mu only, no sampling) for stable training.
-    """
-    vae_model.eval()
-    all_latents = []
-    all_labels = []
-    
-    # Prepare normalization tensors
-    if norm_stats is not None:
-        mean = torch.tensor(norm_stats['mean']).to(device)
-        std = torch.tensor(norm_stats['std']).to(device)
-        print("Using VAE normalization stats for encoding")
-    
-    print("Encoding data to latent space...")
-    with torch.no_grad():
-        for batch_seq, batch_labels in tqdm(dataloader, desc="Encoding"):
-            batch_size, seq_len, feat_dim = batch_seq.shape
-            
-            # Flatten to encode each frame
-            x = batch_seq.view(-1, feat_dim).to(device)
-            
-            # Normalize input
-            if norm_stats is not None:
-                x = (x - mean) / std
-            
-            # Encode through VAE - use deterministic (mu only)
-            mu, _ = vae_model.encode(x)
-            
-            # Reshape back to sequences
-            latent_seq = mu.view(batch_size, seq_len, -1)
-            
-            all_latents.append(latent_seq.cpu())
-            all_labels.append(batch_labels)
-    
-    latent_sequences = torch.cat(all_latents, dim=0)
-    labels = torch.cat(all_labels, dim=0)
-    
-    print(f"Encoded shape: {latent_sequences.shape}")
-    return latent_sequences, labels
+
 
 
 def compute_multistep_loss(predictions, targets, horizons=[1, 4, 8, 16]):
@@ -190,6 +151,39 @@ def compute_directional_loss(predictions, targets, inputs):
     direction_loss = (1 - direction_agreement) / 2
     
     return direction_loss
+
+
+def compute_diversity_loss(predictions, targets):
+    """
+    Loss that penalizes when predictions are too similar across different inputs.
+    
+    WHY THIS MATTERS:
+    - If the model ignores input and outputs the same thing for all sequences,
+      the batch variance of predictions will be near zero.
+    - Ground truth has natural variance across different samples.
+    - This loss encourages the model to produce varied outputs.
+    
+    Args:
+        predictions: (Batch, Seq, Latent)
+        targets: (Batch, Seq, Latent)
+    
+    Returns:
+        diversity_loss: Penalizes when predictions lack batch diversity
+    """
+    # Compute variance across batch dimension for predictions and targets
+    pred_batch_var = predictions.var(dim=0).mean()  # Variance over batch
+    target_batch_var = targets.var(dim=0).mean()    # Ground truth variance
+    
+    # We want pred_batch_var to be close to target_batch_var
+    # If pred_batch_var << target_batch_var, model is ignoring inputs
+    # Use ratio-based loss: penalize when predictions are less varied than targets
+    var_ratio = pred_batch_var / (target_batch_var + 1e-8)
+    
+    # Loss is high when ratio < 1 (predictions less varied than targets)
+    # ReLU(1 - ratio) = 0 when ratio >= 1, increases as ratio decreases
+    diversity_loss = torch.relu(1.0 - var_ratio)
+    
+    return diversity_loss
 
 
 def train_epoch_multistep(model, inputs, targets, optimizer, device, epoch, total_epochs):
@@ -265,8 +259,11 @@ def train_epoch_multistep(model, inputs, targets, optimizer, device, epoch, tota
         # Directional loss
         dir_loss = compute_directional_loss(pred_sequence, target_portion, input_portion)
         
-        # Combined loss
-        loss = mse_loss + 0.5 * dir_loss
+        # Batch diversity loss (prevents model from ignoring input)
+        diversity_loss = compute_diversity_loss(pred_sequence, target_portion)
+        
+        # Combined loss with diversity regularization
+        loss = mse_loss + 0.5 * dir_loss + 2.0 * diversity_loss
         
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -392,27 +389,20 @@ def train_gru_multistep(config=None):
     
     vae.eval()
     
-    # 2. Load dataset
-    print("Loading dataset...")
-    full_dataset = BCIDataset("data/processed/train", sequence_length=SEQUENCE_LENGTH)
-    full_loader = DataLoader(full_dataset, batch_size=batch_size, shuffle=False)
-    print(f"[OK] Dataset loaded: {len(full_dataset)} sequences\n")
+    # 2. Load pre-normalized dataset using shared utilities
+    print("Loading pre-normalized dataset...")
+    train_loader, val_loader, norm_stats = get_data_loaders(batch_size=batch_size)
     
-    # 3. Encode to latent space
-    # Load VAE normalization stats
-    if os.path.exists(VAE_STATS_PATH):
-        vae_norm_stats = np.load(VAE_STATS_PATH, allow_pickle=True).item()
-    else:
-        # Fallback to old stats
-        fallback_stats = f"checkpoints/vae/vae_norm_stats_latent{latent_dim}.npy"
-        if os.path.exists(fallback_stats):
-            vae_norm_stats = np.load(fallback_stats, allow_pickle=True).item()
-        else:
-            print("[ERROR] No normalization stats found!")
-            return None, None
+    # For GRU, we need all data encoded to latent space
+    # Load the full normalized dataset as memmap (no RAM copy needed yet)
+    normalized_data, _ = load_normalized_dataset()
+    print(f"[OK] Dataset memmap loaded: {len(normalized_data)} sequences\n")
     
-    latent_sequences, labels = encode_to_latent(vae, full_loader, device, vae_norm_stats)
-    print(f"[OK] Encoding complete\n")
+    # 3. Encode to latent space using the encode_to_latent utility
+    # It handles batching and GPU transfer internally to avoid OOM
+    print("Encoding to latent space (batched)...")
+    latent_sequences = encode_to_latent(vae, normalized_data, device)
+    print(f"[OK] Encoding complete: {latent_sequences.shape}\n")
     
     # 4. Normalize latent space
     print("Normalizing latent space...")

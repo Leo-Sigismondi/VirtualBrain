@@ -1,204 +1,319 @@
 """
-Evaluation script for Tangent Space Diffusion Model.
+Evaluate Conditional Diffusion Model
 
-Validates that generated matrices are valid SPD and compares
-their statistics to real data.
+This script evaluates the conditional diffusion model with two modes:
+1. 'vae' mode: Use real VAE-encoded latents (tests if diffusion works)
+2. 'gru' mode: Use GRU-predicted latents (tests full pipeline)
+
+Usage:
+    python scripts/evaluate_diffusion.py --mode vae
+    python scripts/evaluate_diffusion.py --mode gru
 """
 
+import argparse
 import os
 import sys
-import torch
 import numpy as np
+import torch
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.models.diffusion import TangentDiffusion
-from src.data.dataset import BCIDataset
+from src.models.vae import ImprovedVAE
+from src.models.gru import TemporalGRU
+from src.data.data_utils import (
+    load_normalized_dataset, get_normalization_stats, encode_to_latent,
+    INPUT_DIM, N_CHANNELS, SEQUENCE_LENGTH as SEQ_LEN
+)
 from src.preprocessing.geometry_utils import (
-    validate_spd, exp_euclidean_map, vec_to_sym_matrix, riemannian_distance
+    validate_spd, exp_euclidean_map, vec_to_sym_matrix
 )
 
-# Config
-INPUT_DIM = 253
-N_CHANNELS = 22  # 22*23/2 = 253 (lower triangle + diagonal)
+# ============================================================================
+# Configuration
+# ============================================================================
+
+# Data dimensions imported from data_utils (INPUT_DIM=253, N_CHANNELS=22, SEQ_LEN=64)
+VAE_LATENT_DIM = 32
+GRU_HIDDEN_DIM = 128
+
+# Paths
 DIFFUSION_PATH = "checkpoints/diffusion/tangent_diffusion_best.pth"
-NORM_STATS_PATH = "data/processed/normalization_stats.npy"  # Same path as preprocess_normalize.py
+VAE_PATH = "checkpoints/vae/vae_dynamics_latent32.pth"
+GRU_PATH = "checkpoints/gru/gru_multistep_L32_H128_2L_best.pth"
+
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-def load_norm_stats():
-    """Load normalization statistics for denormalization."""
-    if os.path.exists(NORM_STATS_PATH):
-        stats = np.load(NORM_STATS_PATH, allow_pickle=True).item()
-        print(f"[OK] Loaded norm stats: mean={stats['mean']:.4f}, std={stats['std']:.4f}")
-        return stats
-    else:
-        print("⚠️ No normalization stats found, using identity")
-        return {'mean': 0.0, 'std': 1.0}
+# ============================================================================
+# Model Loading
+# ============================================================================
 
-
-def evaluate_spd_constraints(diffusion, norm_stats, num_samples=100, seq_len=64):
-    """
-    Generate samples and validate SPD constraints.
+def load_models(mode='vae'):
+    """Load required models based on evaluation mode."""
+    models = {}
     
-    Returns detailed diagnostics about eigenvalues and condition numbers.
-    """
-    print("\n" + "="*60)
-    print("SPD Constraint Validation")
-    print("="*60)
-    
-    diffusion.eval()
-    
-    # Generate samples
-    print(f"\nGenerating {num_samples} samples...")
-    samples = diffusion.sample_ddim(
-        (num_samples, seq_len, INPUT_DIM),
-        condition=None,
-        device=DEVICE,
-        steps=50
-    )
-    
-    # Denormalize samples to original scale
-    data_mean = norm_stats['mean']
-    data_std = norm_stats['std']
-    samples = samples * data_std + data_mean
-    print(f"Denormalized samples: mean={samples.mean().item():.4f}, std={samples.std().item():.4f}")
-    print(f"  Range: min={samples.min().item():.4f}, max={samples.max().item():.4f}")
-    
-    # No clamping needed - exp(symmetric matrix) is mathematically guaranteed SPD
-    
-    # Validate each timestep
-    all_min_eigvals = []
-    all_max_eigvals = []
-    all_condition_numbers = []
-    all_valid = []
-    
-    print("Validating SPD constraints...")
-    for t in tqdm(range(seq_len), desc="Timesteps"):
-        tangent_vecs = samples[:, t, :]  # (B, 253)
-        
-        # Reconstruct symmetric matrix using same function as training
-        matrices = vec_to_sym_matrix(tangent_vecs, N_CHANNELS)
-        
-        # Map to SPD manifold
-        spd_matrices = exp_euclidean_map(matrices)
-        
-        try:
-            # With correct vec_to_sym_matrix, exp(symmetric) guarantees SPD
-            # Eigenvalues are always positive but can be very small (~1e-13)
-            # Check for actual positivity manually
-            eigvals = torch.linalg.eigvalsh(spd_matrices.double())
-            min_eigval = eigvals.min(dim=-1).values
-            max_eigval = eigvals.max(dim=-1).values
-            
-            # Consider valid if min eigenvalue > -1e-10 (numerical tolerance)
-            is_valid = min_eigval > -1e-10
-            
-            all_valid.append(is_valid.float().mean().item())
-            all_min_eigvals.append(min_eigval.min().item())
-            all_max_eigvals.append(max_eigval.max().item())
-            all_condition_numbers.append((max_eigval / (min_eigval.abs() + 1e-15)).mean().item())
-        except Exception as e:
-            print(f"\n⚠️ Timestep {t}: Numerical issue - {e}")
-            all_valid.append(0.0)
-            all_min_eigvals.append(float('nan'))
-            all_max_eigvals.append(float('nan'))
-            all_condition_numbers.append(float('inf'))
-    
-    # Summary
-    print(f"\n{'─'*40}")
-    print("RESULTS")
-    print(f"{'─'*40}")
-    print(f"✓ SPD Valid Rate: {np.mean(all_valid)*100:.2f}%")
-    print(f"  Min Eigenvalue: {np.min(all_min_eigvals):.6f}")
-    print(f"  Max Eigenvalue: {np.max(all_max_eigvals):.2f}")
-    print(f"  Avg Condition Number: {np.mean(all_condition_numbers):.2f}")
-    
-    if np.mean(all_valid) == 1.0:
-        print("\n✅ ALL GENERATED MATRICES ARE VALID SPD!")
-    else:
-        print(f"\n⚠️ Warning: {(1-np.mean(all_valid))*100:.2f}% matrices failed validation")
-    
-    return {
-        'valid_rate': np.mean(all_valid),
-        'min_eigenvalue': np.min(all_min_eigvals),
-        'max_eigenvalue': np.max(all_max_eigvals),
-        'avg_condition': np.mean(all_condition_numbers)
-    }
-
-
-def compare_to_real_data(diffusion, norm_stats, real_data_path="data/processed/train"):
-    """
-    Compare generated sample statistics to real data.
-    """
-    print("\n" + "="*60)
-    print("Comparison to Real Data")
-    print("="*60)
-    
-    # Load real data
-    dataset = BCIDataset(real_data_path, sequence_length=64)
-    real_sample = dataset[0][0]  # (T, D)
-    
-    # Generate samples
-    generated = diffusion.sample_ddim(
-        (10, 64, INPUT_DIM), condition=None, device=DEVICE, steps=50
-    )
-    
-    # Denormalize generated samples
-    data_mean = norm_stats['mean']
-    data_std = norm_stats['std']
-    generated = (generated * data_std + data_mean).cpu()
-    
-    # Compare statistics
-    print(f"\n{'Statistic':<25} {'Real Data':<15} {'Generated':<15}")
-    print("─" * 55)
-    
-    real_mean = real_sample.mean().item()
-    gen_mean = generated.mean().item()
-    print(f"{'Mean':<25} {real_mean:<15.4f} {gen_mean:<15.4f}")
-    
-    real_std = real_sample.std().item()
-    gen_std = generated.std().item()
-    print(f"{'Std':<25} {real_std:<15.4f} {gen_std:<15.4f}")
-    
-    real_min = real_sample.min().item()
-    gen_min = generated.min().item()
-    print(f"{'Min':<25} {real_min:<15.4f} {gen_min:<15.4f}")
-    
-    real_max = real_sample.max().item()
-    gen_max = generated.max().item()
-    print(f"{'Max':<25} {real_max:<15.4f} {gen_max:<15.4f}")
-
-
-def main():
-    print("\n🔬 Tangent Space Diffusion Model Evaluation")
-    print("="*60)
-    
-    # Load normalization stats
-    norm_stats = load_norm_stats()
-    
-    # Load model with FIXED schedule (ignore saved schedule buffers)
-    print(f"\nLoading model from {DIFFUSION_PATH}...")
+    # Always load diffusion
+    print(f"Loading Diffusion from {DIFFUSION_PATH}...")
     diffusion = TangentDiffusion(
         tangent_dim=INPUT_DIM,
         hidden_dim=512,
-        condition_dim=128,
+        condition_dim=VAE_LATENT_DIM,
         n_steps=1000
     ).to(DEVICE)
-    
-    # Load full model (schedule is now fixed in the saved checkpoint)
     diffusion.load_state_dict(torch.load(DIFFUSION_PATH, map_location=DEVICE))
     diffusion.eval()
-    print(f"✓ Model loaded (full state dict)")
+    models['diffusion'] = diffusion
+    print("[OK] Diffusion loaded")
     
-    # Run evaluations
+    # Always load VAE (needed for conditioning)
+    print(f"Loading VAE from {VAE_PATH}...")
+    vae = ImprovedVAE(input_dim=INPUT_DIM, latent_dim=VAE_LATENT_DIM).to(DEVICE)
+    vae.load_state_dict(torch.load(VAE_PATH, map_location=DEVICE))
+    vae.eval()
+    models['vae'] = vae
+    print("[OK] VAE loaded")
+    
+    # Load GRU only for gru mode
+    if mode == 'gru':
+        print(f"Loading GRU from {GRU_PATH}...")
+        gru = TemporalGRU(
+            latent_dim=VAE_LATENT_DIM,
+            hidden_dim=GRU_HIDDEN_DIM,
+            num_layers=2,
+            dropout=0.2
+        ).to(DEVICE)
+        gru.load_state_dict(torch.load(GRU_PATH, map_location=DEVICE))
+        gru.eval()
+        models['gru'] = gru
+        print("[OK] GRU loaded")
+    
+    return models
+
+
+def load_data(num_samples=100):
+    """Load normalized data and normalization stats using shared utilities."""
+    # Load data and stats from shared utilities
+    normalized_data, norm_stats = load_normalized_dataset()
+    
+    # Sample random indices
+    np.random.seed(42)
+    indices = np.random.choice(len(normalized_data), num_samples, replace=False)
+    data = torch.from_numpy(normalized_data[indices].copy()).float().to(DEVICE)
+    
+    return data, norm_stats
+
+
+# ============================================================================
+# Condition Generation
+# ============================================================================
+
+def get_vae_conditions(models, data):
+    """Encode real data with VAE to get latent conditions."""
+    vae = models['vae']
+    batch_size, seq_len, input_dim = data.shape
+    
     with torch.no_grad():
-        spd_results = evaluate_spd_constraints(diffusion, norm_stats)
-        compare_to_real_data(diffusion, norm_stats)
+        flat = data.view(-1, input_dim)
+        latent_mu, _ = vae.encode(flat)
+        # Average over time for sequence-level condition
+        conditions = latent_mu.view(batch_size, seq_len, -1).mean(dim=1)
+    
+    return conditions
+
+
+def get_gru_conditions(models, data, seed_steps=5):
+    """
+    Use GRU to predict latent trajectories, then use as conditions.
+    
+    This tests if GRU learned correct dynamics:
+    - If GRU predictions are good → diffusion generates realistic samples
+    - If GRU predictions are bad → diffusion output will be poor
+    """
+    vae = models['vae']
+    gru = models['gru']
+    batch_size, seq_len, input_dim = data.shape
+    
+    # Load latent normalization stats (GRU was trained on normalized latents)
+    latent_stats_path = "checkpoints/gru/latent_norm_stats_multistep.npy"
+    if os.path.exists(latent_stats_path):
+        stats = np.load(latent_stats_path, allow_pickle=True).item()
+        l_mean = torch.tensor(stats['mean']).to(data.device)
+        l_std = torch.tensor(stats['std']).to(data.device)
+    else:
+        print(f"[WARNING] No latent stats found at {latent_stats_path}. Using identity.")
+        l_mean = torch.zeros(1).to(data.device)
+        l_std = torch.ones(1).to(data.device)
+
+    with torch.no_grad():
+        # Encode to latent space
+        flat = data.view(-1, input_dim)
+        latent_mu = encode_to_latent(vae, data, data.device).to(data.device)
+        latent_seq = latent_mu.view(batch_size, seq_len, -1)
+        
+        # Use last seed step as starting point for prediction
+        z_start = latent_seq[:, seed_steps-1:seed_steps, :]  # (B, 1, 32)
+        
+        # Normalize z_start for GRU
+        z_start_norm = (z_start - l_mean) / (l_std + 1e-8)
+        
+        # GRU autoregressive prediction (in normalized space)
+        num_predict = seq_len - seed_steps
+        predicted_norm = gru.generate_sequence(z_start_norm, num_predict)  # (B, num_predict, 32)
+        
+        # Denormalize predictions
+        predicted = predicted_norm * (l_std + 1e-8) + l_mean
+        
+        # Combine seed + predicted (both in original latent space)
+        full_seq = torch.cat([latent_seq[:, :seed_steps, :], predicted], dim=1)  # (B, seq_len, 32)
+        
+        # Use predicted latent as condition (average)
+        conditions = full_seq.mean(dim=1)
+    
+    return conditions
+
+
+# ============================================================================
+# Evaluation
+# ============================================================================
+
+def evaluate_spd(samples, norm_stats):
+    """Validate SPD constraints on generated samples."""
+    data_mean = norm_stats['mean']
+    data_std = norm_stats['std']
+    
+    # Denormalize
+    samples_denorm = samples * data_std + data_mean
+    samples_denorm = samples_denorm.cpu()
+    
+    batch_size, seq_len, _ = samples.shape
+    all_valid = []
+    all_min_eigvals = []
+    
+    for t in range(seq_len):
+        tangent_vecs = samples_denorm[:, t, :]
+        matrices = vec_to_sym_matrix(tangent_vecs, N_CHANNELS)
+        spd_matrices = exp_euclidean_map(matrices)
+        
+        try:
+            eigvals = torch.linalg.eigvalsh(spd_matrices.double())
+            min_eigval = eigvals.min(dim=-1).values
+            is_valid = min_eigval > -1e-10
+            all_valid.append(is_valid.float().mean().item())
+            all_min_eigvals.append(min_eigval.min().item())
+        except:
+            all_valid.append(0.0)
+            all_min_eigvals.append(float('nan'))
+    
+    spd_rate = np.mean(all_valid)
+    min_eigval = np.nanmin(all_min_eigvals)
+    
+    return spd_rate, min_eigval
+
+
+def compare_statistics(real_data, generated, norm_stats):
+    """Compare statistics between real and generated samples."""
+    data_mean = norm_stats['mean']
+    data_std = norm_stats['std']
+    
+    # Denormalize
+    real_denorm = (real_data * data_std + data_mean).cpu()
+    gen_denorm = (generated * data_std + data_mean).cpu()
+    
+    stats = {
+        'real_mean': real_denorm.mean().item(),
+        'gen_mean': gen_denorm.mean().item(),
+        'real_std': real_denorm.std().item(),
+        'gen_std': gen_denorm.std().item(),
+        'real_min': real_denorm.min().item(),
+        'gen_min': gen_denorm.min().item(),
+        'real_max': real_denorm.max().item(),
+        'gen_max': gen_denorm.max().item(),
+    }
+    
+    return stats
+
+
+# ============================================================================
+# Main
+# ============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate Conditional Diffusion")
+    parser.add_argument('--mode', choices=['vae', 'gru'], default='vae',
+                        help="Condition source: 'vae' (real latents) or 'gru' (predicted)")
+    parser.add_argument('--num_samples', type=int, default=100,
+                        help="Number of samples to generate")
+    parser.add_argument('--seed_steps', type=int, default=5,
+                        help="Seed steps for GRU prediction (only for gru mode)")
+    args = parser.parse_args()
     
     print("\n" + "="*60)
-    print("Evaluation Complete!")
+    print(f"Conditional Diffusion Evaluation (mode: {args.mode.upper()})")
+    print("="*60)
+    
+    # Load models
+    models = load_models(args.mode)
+    
+    # Load data
+    print(f"\nLoading {args.num_samples} samples...")
+    data, norm_stats = load_data(args.num_samples)
+    print(f"[OK] Data loaded: shape {data.shape}")
+    
+    # Get conditions based on mode
+    print(f"\nGenerating conditions ({args.mode} mode)...")
+    if args.mode == 'vae':
+        conditions = get_vae_conditions(models, data)
+        print("[OK] Using real VAE-encoded latents as conditions")
+    else:
+        conditions = get_gru_conditions(models, data, args.seed_steps)
+        print(f"[OK] Using GRU-predicted latents (seed={args.seed_steps} steps)")
+    
+    print(f"    Condition stats: mean={conditions.mean().item():.4f}, std={conditions.std().item():.4f}")
+    
+    # Generate samples
+    print(f"\nGenerating {args.num_samples} samples with diffusion...")
+    with torch.no_grad():
+        generated = models['diffusion'].sample_ddim(
+            (args.num_samples, SEQ_LEN, INPUT_DIM),
+            condition=conditions,
+            device=DEVICE,
+            steps=50
+        )
+    print("[OK] Samples generated")
+    
+    # Evaluate SPD
+    print("\nValidating SPD constraints...")
+    spd_rate, min_eigval = evaluate_spd(generated, norm_stats)
+    
+    # Compare to real data
+    stats = compare_statistics(data, generated, norm_stats)
+    
+    # Print results
+    print("\n" + "="*60)
+    print("RESULTS")
+    print("="*60)
+    
+    print(f"\n📊 SPD Validation:")
+    print(f"   Valid Rate: {spd_rate*100:.2f}%")
+    print(f"   Min Eigenvalue: {min_eigval:.6f}")
+    
+    if spd_rate == 1.0:
+        print("   ✅ All matrices are valid SPD!")
+    else:
+        print(f"   ⚠️ {(1-spd_rate)*100:.2f}% failed validation")
+    
+    print(f"\n📈 Statistics Comparison:")
+    print(f"   {'Metric':<15} {'Real':<15} {'Generated':<15} {'Diff':<10}")
+    print("   " + "-"*55)
+    print(f"   {'Mean':<15} {stats['real_mean']:<15.4f} {stats['gen_mean']:<15.4f} {abs(stats['real_mean']-stats['gen_mean']):<10.4f}")
+    print(f"   {'Std':<15} {stats['real_std']:<15.4f} {stats['gen_std']:<15.4f} {abs(stats['real_std']-stats['gen_std']):<10.4f}")
+    print(f"   {'Min':<15} {stats['real_min']:<15.4f} {stats['gen_min']:<15.4f} {abs(stats['real_min']-stats['gen_min']):<10.4f}")
+    print(f"   {'Max':<15} {stats['real_max']:<15.4f} {stats['gen_max']:<15.4f} {abs(stats['real_max']-stats['gen_max']):<10.4f}")
+    
+    print("\n" + "="*60)
+    print("Done!")
     print("="*60 + "\n")
 
 

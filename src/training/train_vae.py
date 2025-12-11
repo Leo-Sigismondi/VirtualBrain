@@ -60,8 +60,11 @@ if str(project_root) not in sys.path:
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
-from src.data.dataset import BCIDataset
+from torch.utils.data import DataLoader
+from src.data.data_utils import (
+    get_data_loaders, load_normalized_dataset, get_normalization_stats,
+    NormalizedDataset, INPUT_DIM, SEQUENCE_LENGTH
+)
 from src.models.vae import ImprovedVAE
 import os
 import numpy as np
@@ -70,10 +73,9 @@ from tqdm import tqdm
 # --- CONFIG ---
 BATCH_SIZE = 512
 EPOCHS = 100
-LEARNING_RATE = 5e-4  # Slightly higher for new architecture
+LEARNING_RATE = 5e-4
 LATENT_DIM = 32
-INPUT_DIM = 253
-SEQUENCE_LENGTH = 64
+# INPUT_DIM = 253 and SEQUENCE_LENGTH = 64 imported from data_utils
 
 # Loss weights (carefully tuned)
 BETA = 0.5          # KL weight (beta-VAE style, lower = more reconstruction focus)
@@ -218,8 +220,8 @@ def split_dataset(dataset):
     return train_indices, val_indices
 
 
-def evaluate(model, dataloader, device, mean, std, beta, dynamics_weight):
-    """Evaluate model on validation set"""
+def evaluate(model, dataloader, device, beta, dynamics_weight):
+    """Evaluate model on validation set (assumes pre-normalized data)"""
     model.eval()
     total_loss = 0
     total_recon = 0
@@ -228,12 +230,12 @@ def evaluate(model, dataloader, device, mean, std, beta, dynamics_weight):
     num_batches = 0
     
     with torch.no_grad():
-        for batch_seq, _ in dataloader:
+        for batch in dataloader:
+            batch_seq = batch[0]  # NormalizedDataset returns tuple
             batch_size, seq_len, feat_dim = batch_seq.shape
             batch_seq = batch_seq.to(device)
             
-            # Normalize
-            batch_seq = (batch_seq - mean) / std
+            # Data is already normalized, no need to normalize again
             
             # Flatten for VAE
             x = batch_seq.view(-1, feat_dim)
@@ -295,49 +297,23 @@ def train_dynamics_vae(config=None):
     print(f"Device: {device}")
     print(f"{'='*60}\n")
     
-    # 1. Load dataset
-    print("Loading dataset...")
-    full_dataset = BCIDataset("data/processed/train", sequence_length=SEQUENCE_LENGTH)
-    print(f"[OK] Dataset loaded: {len(full_dataset)} sequences\n")
+    # 1. Load pre-normalized dataset using shared utilities
+    # This ensures consistent normalization across VAE, GRU, and Diffusion models
+    print("Loading pre-normalized dataset...")
+    train_loader, val_loader, norm_stats = get_data_loaders(batch_size=batch_size)
     
-    # 2. Split train/val
-    train_indices, val_indices = split_dataset(full_dataset)
-    train_dataset = Subset(full_dataset, train_indices)
-    val_dataset = Subset(full_dataset, val_indices)
+    # Get normalization stats as tensors
+    train_mean = torch.tensor(norm_stats['mean']).to(device)
+    train_std = torch.tensor(norm_stats['std']).to(device)
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    print(f"[OK] Dataset loaded (pre-normalized)")
+    print(f"Train: {len(train_loader.dataset)} sequences")
+    print(f"Val: {len(val_loader.dataset)} sequences")
+    print(f"Norm stats: mean={norm_stats['mean']:.4f}, std={norm_stats['std']:.4f}\n")
     
-    print(f"Train: {len(train_dataset)} sequences")
-    print(f"Val: {len(val_dataset)} sequences\n")
-    
-    # 3. Calculate normalization stats
-    print("Calculating normalization stats...")
-    if os.path.exists(stats_path):
-        print(f"Loading existing stats from {stats_path}")
-        norm_stats = np.load(stats_path, allow_pickle=True).item()
-        train_mean = torch.tensor(norm_stats['mean'])
-        train_std = torch.tensor(norm_stats['std'])
-    else:
-        print("Computing stats from training data...")
-        all_train_data = []
-        for batch_seq, _ in train_loader:
-            all_train_data.append(batch_seq.view(-1, INPUT_DIM))
-        
-        all_train_data = torch.cat(all_train_data, dim=0)
-        train_mean = all_train_data.mean(dim=0)
-        train_std = all_train_data.std(dim=0)
-        train_std[train_std < 1e-8] = 1.0
-        
-        # Save stats
-        norm_stats = {
-            'mean': train_mean.cpu().numpy(),
-            'std': train_std.cpu().numpy()
-        }
-        np.save(stats_path, norm_stats)
-        print(f"[OK] Stats saved to {stats_path}\n")
-    
-    train_mean = train_mean.to(device)
+    # Data is already normalized, so we use identity transform in training
+    # train_mean and train_std are still used for saving/reference
+    use_normalized = True  # Flag to indicate data is pre-normalized
     train_std = train_std.to(device)
     
     # 4. Create model
@@ -377,12 +353,12 @@ def train_dynamics_vae(config=None):
         num_batches = 0
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False)
-        for batch_seq, _ in pbar:
+        for batch in pbar:
+            batch_seq = batch[0]  # NormalizedDataset returns tuple
             batch_size_actual, seq_len, feat_dim = batch_seq.shape
             batch_seq = batch_seq.to(device)
             
-            # Normalize
-            batch_seq = (batch_seq - train_mean) / train_std
+            # Data is already normalized, no need to normalize again
             
             # Flatten for VAE
             x = batch_seq.view(-1, feat_dim)
@@ -423,7 +399,7 @@ def train_dynamics_vae(config=None):
             train_metrics[k] /= num_batches
         
         # Validation
-        val_metrics = evaluate(model, val_loader, device, train_mean, train_std, beta, dynamics_weight)
+        val_metrics = evaluate(model, val_loader, device, beta, dynamics_weight)
         
         # Scheduler
         scheduler.step()
