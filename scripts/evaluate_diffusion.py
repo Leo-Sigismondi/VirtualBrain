@@ -27,7 +27,7 @@ from src.data.data_utils import (
     INPUT_DIM, N_CHANNELS, SEQUENCE_LENGTH as SEQ_LEN
 )
 from src.preprocessing.geometry_utils import (
-    validate_spd, exp_euclidean_map, vec_to_sym_matrix
+    validate_spd, exp_euclidean_map, vec_to_sym_matrix, riemannian_distance
 )
 
 # ============================================================================
@@ -315,6 +315,48 @@ def main():
     print("\n" + "="*60)
     print("Done!")
     print("="*60 + "\n")
+    
+    # 4. Riemannian Fidelity
+    print("Calculating Riemannian Fidelity...")
+    evaluate_riemannian_fidelity(data, generated, norm_stats)
+
+
+def evaluate_riemannian_fidelity(real_samples, gen_samples, norm_stats):
+    """Calculate mean Riemannian distance between real and generated samples."""
+    device = gen_samples.device
+    
+    # Convert real_samples if needed
+    if isinstance(real_samples, np.ndarray):
+        real_samples = torch.from_numpy(real_samples).float().to(device)
+    
+    # Denormalize
+    mean = torch.tensor(norm_stats['mean']).to(device)
+    std = torch.tensor(norm_stats['std']).to(device)
+    
+    real = real_samples * std + mean
+    gen = gen_samples * std + mean
+    
+    # Process in chunks
+    batch_size = 16
+    total_dist = 0
+    num_batches = 0
+    
+    with torch.no_grad():
+        for i in range(0, min(real.shape[0], 50), batch_size):  # Limit to 50 samples for speed
+            r_batch = real[i:i+batch_size].reshape(-1, INPUT_DIM)
+            g_batch = gen[i:i+batch_size].reshape(-1, INPUT_DIM)
+            
+            # Map to SPD
+            spd_real = exp_euclidean_map(vec_to_sym_matrix(r_batch, N_CHANNELS))
+            spd_gen = exp_euclidean_map(vec_to_sym_matrix(g_batch, N_CHANNELS))
+            
+            # Log-Euclidean distance
+            dists = riemannian_distance(spd_real, spd_gen, metric='affine_invariant')
+            total_dist += dists.mean().item()
+            num_batches += 1
+            
+    avg_dist = total_dist / num_batches if num_batches > 0 else 0
+    print(f"Mean Riemannian Distance (Affine Invariant): {avg_dist:.4f}")
 
 
 if __name__ == "__main__":
