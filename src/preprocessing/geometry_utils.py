@@ -1,38 +1,57 @@
 import torch
+import math
+
+# √2 constant for isometric scaling
+_SQRT2 = math.sqrt(2.0)
 
 def sym_matrix_to_vec(matrix):
     """
-    Prende una matrice simmetrica (N, N) e la appiattisce in un vettore.
-    Prende solo il triangolo inferiore per evitare duplicati.
+    Convert symmetric matrix to vector with ISOMETRIC scaling.
+    
+    Off-diagonal elements are scaled by √2 to preserve Frobenius norm:
+    ||vec||² = ||matrix||_F²
+    
     Input: (..., N, N)
     Output: (..., N*(N+1)/2)
     """
-    # Estraiamo gli indici del triangolo inferiore
     n = matrix.shape[-1]
-    # tril_indices restituisce gli indici (riga, colonna) del triangolo inferiore
-    rows, cols = torch.tril_indices(n, n)
+    rows, cols = torch.tril_indices(n, n, device=matrix.device)
     
-    # Se l'input è un batch (Batch, N, N), usiamo indicizzazione avanzata
-    return matrix[..., rows, cols]
+    # Extract lower triangle
+    vec = matrix[..., rows, cols].clone()
+    
+    # Create mask for off-diagonal elements (where row != col)
+    off_diag_mask = rows != cols
+    
+    # Scale off-diagonal elements by √2 for isometry
+    vec[..., off_diag_mask] = vec[..., off_diag_mask] * _SQRT2
+    
+    return vec
 
 def vec_to_sym_matrix(vec, n):
     """
-    Inverse operation: reconstruct symmetric matrix from vector.
+    Reconstruct symmetric matrix from vector with ISOMETRIC scaling.
+    
+    Off-diagonal elements are divided by √2 to reverse the isometric transform.
+    
     Input: (..., D) where D = N*(N+1)/2
     Output: (..., N, N)
-    
-    CORRECT IMPLEMENTATION: Does not double diagonal.
-    Vector contains lower triangle + diagonal.
     """
     batch_shape = vec.shape[:-1]
+    rows, cols = torch.tril_indices(n, n, device=vec.device)
+    
+    # Create mask for off-diagonal elements
+    off_diag_mask = rows != cols
+    
+    # Reverse the √2 scaling for off-diagonal elements
+    vec_unscaled = vec.clone()
+    vec_unscaled[..., off_diag_mask] = vec_unscaled[..., off_diag_mask] / _SQRT2
+    
+    # Build matrix
     matrix = torch.zeros(*batch_shape, n, n, device=vec.device, dtype=vec.dtype)
+    matrix[..., rows, cols] = vec_unscaled
     
-    # Fill lower triangle (including diagonal)
-    rows, cols = torch.tril_indices(n, n)
-    matrix[..., rows, cols] = vec
-    
-    # Make symmetric: add transpose, subtract diagonal to avoid doubling
-    # M + M.T doubles everything, so subtract diagonal once
+    # Make symmetric: M + M.T - diag(M) to avoid doubling diagonal
     matrix = matrix + matrix.transpose(-2, -1) - torch.diag_embed(matrix.diagonal(dim1=-2, dim2=-1))
     
     return matrix
@@ -55,7 +74,63 @@ def log_euclidean_map(spd_matrix):
     
     return log_matrix
 
-def exp_euclidean_map(tangent_matrix):
+def ensure_spd(matrix, epsilon=1e-8):
+    """
+    Ensures the matrix is SPD (Symmetric Positive Definite).
+    
+    Handles numerical errors by:
+    1. Forcing symmetry if needed
+    2. Adding jitter regularization if eigenvalues are non-positive
+    
+    Works with both numpy arrays and torch tensors.
+    
+    Args:
+        matrix: (..., N, N) matrix to fix
+        epsilon: Minimum eigenvalue threshold
+        
+    Returns:
+        matrix_fixed: SPD-guaranteed matrix
+        was_valid: Boolean indicating if matrix was already valid
+    """
+    is_torch = isinstance(matrix, torch.Tensor)
+    
+    if is_torch:
+        # Force symmetry
+        matrix = (matrix + matrix.transpose(-2, -1)) / 2
+        
+        # Check eigenvalues
+        eigvals = torch.linalg.eigvalsh(matrix)
+        min_eig = eigvals.min()
+        
+        if min_eig > 0:
+            return matrix, True
+        
+        # Add jitter to fix non-positive eigenvalues
+        jitter = abs(min_eig.item()) + epsilon
+        n = matrix.shape[-1]
+        eye = torch.eye(n, device=matrix.device, dtype=matrix.dtype)
+        matrix_fixed = matrix + eye * jitter
+        
+        return matrix_fixed, False
+    else:
+        import numpy as np
+        # Numpy version
+        if not np.allclose(matrix, matrix.T):
+            matrix = (matrix + matrix.T) / 2
+        
+        eigvals = np.linalg.eigvalsh(matrix)
+        
+        if np.all(eigvals > 0):
+            return matrix, True
+        
+        min_eig = np.min(eigvals)
+        jitter = abs(min_eig) + epsilon
+        matrix_fixed = matrix + np.eye(matrix.shape[0]) * jitter
+        
+        return matrix_fixed, False
+
+
+def exp_euclidean_map(tangent_matrix, ensure_valid=True):
     """
     Mappa dallo Spazio Tangente al Manifold SPD.
     Exp(X) = U * exp(S) * U.T
@@ -63,6 +138,10 @@ def exp_euclidean_map(tangent_matrix):
     IMPORTANT: This guarantees the output is SPD!
     - Symmetric: by construction (U @ diag @ U.T)
     - Positive Definite: exp(eigenvalues) > 0 always
+    
+    Args:
+        tangent_matrix: Input tangent space matrix
+        ensure_valid: If True, apply ensure_spd for extra numerical safety
     
     Uses float64 for numerical stability. Output is also float64.
     """
@@ -76,6 +155,10 @@ def exp_euclidean_map(tangent_matrix):
     exp_eigvals = exp_eigvals.clamp(min=1e-15)
     
     spd_matrix = eigvecs @ torch.diag_embed(exp_eigvals) @ eigvecs.transpose(-2, -1)
+    
+    # Apply ensure_spd for extra numerical safety if requested
+    if ensure_valid:
+        spd_matrix, _ = ensure_spd(spd_matrix)
     
     # Keep in float64 for numerical stability
     return spd_matrix

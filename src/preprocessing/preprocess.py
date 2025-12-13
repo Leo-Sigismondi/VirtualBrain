@@ -5,6 +5,11 @@ import mne
 from sklearn.covariance import LedoitWolf
 from tqdm import tqdm
 
+# Import ensure_spd from centralized geometry_utils
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from src.preprocessing.geometry_utils import ensure_spd
+
 # --- CONFIGURAZIONE ---
 DATASET_PATH = "data/BCICIV_2a_gdf.zip"
 EXTRACT_PATH = "data/raw/gdf"
@@ -20,27 +25,7 @@ STRIDE = 0.25         # Sliding window stride in seconds (affects # of timesteps
 # ID Eventi standard del dataset BCI IV 2a
 # 769: Left Hand, 770: Right Hand, 771: Foot, 772: Tongue
 # MNE reads GDF annotations as strings, e.g.: '769', '770'
-TARGET_EVENT_IDS = ['769', '770', '771', '772']
-
-def ensure_spd(matrix, epsilon=1e-5):
-    """
-    Ensures the matrix is SPD (Symmetric Positive Definite).
-    """
-    if not np.allclose(matrix, matrix.T):
-        # Force symmetry if numerical error
-        matrix = (matrix + matrix.T) / 2
-    
-    eigvals = np.linalg.eigvalsh(matrix)
-    
-    if np.all(eigvals > 0):
-        return matrix, True 
-    
-    # Regularization (Shrinkage/Jitter)
-    min_eig = np.min(eigvals)
-    jitter = abs(min_eig) + epsilon
-    matrix_fixed = matrix + np.eye(matrix.shape[0]) * jitter
-    
-    return matrix_fixed, False 
+TARGET_EVENT_IDS = ['769', '770', '771', '772'] 
 
 def extract_and_process_subject(filename, subject_id):
     """
