@@ -90,19 +90,22 @@ class SinusoidalPositionEmbeddings(nn.Module):
 
 class ConditionalMLP(nn.Module):
     """
-    MLP-based denoiser conditioned on:
-    - Timestep (via sinusoidal embedding)
-    - GRU hidden state (temporal context)
+    MLP-based denoiser with FiLM conditioning.
     
-    For sequence data, we process each timestep independently but with
-    the same conditioning. This is simpler than U-Net for our use case.
+    FiLM (Feature-wise Linear Modulation) conditioning is more powerful than
+    simple additive conditioning. The condition produces scale (gamma) and 
+    shift (beta) parameters: h = h * gamma + beta
+    
+    Conditioned on:
+    - Timestep (via sinusoidal embedding)
+    - VAE latent / GRU hidden state (via FiLM)
     """
     def __init__(
         self, 
-        input_dim,          # Latent dimension (32)
+        input_dim,          # Tangent space dimension (253)
         hidden_dim=256,     # Hidden layer size
         time_dim=64,        # Time embedding dimension
-        condition_dim=128,  # GRU hidden dimension
+        condition_dim=128,  # VAE latent / GRU hidden dimension
         num_layers=4,
         dropout=0.1
     ):
@@ -110,6 +113,7 @@ class ConditionalMLP(nn.Module):
         
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
         
         # Time embedding
         self.time_mlp = nn.Sequential(
@@ -119,12 +123,14 @@ class ConditionalMLP(nn.Module):
             nn.Linear(time_dim * 2, time_dim),
         )
         
-        # Condition projection (GRU hidden state)
-        self.condition_proj = nn.Sequential(
-            nn.Linear(condition_dim, hidden_dim),
+        # FiLM condition projection: produces gamma (scale) and beta (shift)
+        # for each layer's hidden dimension
+        self.film_proj = nn.Sequential(
+            nn.Linear(condition_dim, hidden_dim * 2),
             nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim * 2, hidden_dim * 2),
         )
+        # This outputs (hidden_dim * 2): first half is gamma, second half is beta
         
         # Input projection
         self.input_proj = nn.Linear(input_dim, hidden_dim)
@@ -146,12 +152,12 @@ class ConditionalMLP(nn.Module):
     
     def forward(self, x, t, condition=None):
         """
-        Predict noise added to x at timestep t.
+        Predict noise added to x at timestep t with FiLM conditioning.
         
         Args:
-            x: (B, T, D) noisy latent trajectories
+            x: (B, T, D) noisy tangent vectors
             t: (B,) diffusion timestep
-            condition: (B, H) or (B, num_layers, H) GRU hidden state
+            condition: (B, T, H) per-frame condition, OR (B, H) sequence-level condition
         
         Returns:
             noise_pred: (B, T, D) predicted noise
@@ -167,21 +173,34 @@ class ConditionalMLP(nn.Module):
         # Input projection: (B*T, hidden_dim)
         h = self.input_proj(x_flat)
         
-        # Add condition if provided
+        # FiLM conditioning
+        gamma = None
+        beta = None
         if condition is not None:
-            # Handle multi-layer hidden states
-            if condition.dim() == 3:
-                # (B, num_layers, H) -> (B, H) take last layer
-                condition = condition[:, -1, :]
+            # Check for per-frame conditioning (B, T, H)
+            if condition.dim() == 3 and condition.shape[1] == seq_len:
+                # Per-frame condition: flatten directly to (B*T, H)
+                cond_flat = condition.reshape(-1, condition.shape[-1])
+            elif condition.dim() == 3:
+                # Multi-layer hidden states (B, num_layers, H) -> take last layer
+                cond_flat = condition[:, -1, :]
+                cond_flat = cond_flat.unsqueeze(1).expand(-1, seq_len, -1)
+                cond_flat = cond_flat.reshape(-1, condition.shape[-1])
+            else:
+                # Sequence-level condition (B, H) - expand to all frames
+                cond_flat = condition.unsqueeze(1).expand(-1, seq_len, -1)
+                cond_flat = cond_flat.reshape(-1, condition.shape[-1])
             
-            # Project condition: (B, hidden_dim)
-            cond_emb = self.condition_proj(condition)
+            # Project to FiLM parameters: (B*T, hidden_dim * 2)
+            film_params = self.film_proj(cond_flat)
             
-            # Expand to match sequence: (B*T, hidden_dim)
-            cond_emb = cond_emb.unsqueeze(1).expand(-1, seq_len, -1)
-            cond_emb = cond_emb.reshape(-1, self.hidden_dim)
+            # Split into gamma (scale) and beta (shift)
+            gamma = film_params[:, :self.hidden_dim]  # (B*T, hidden_dim)
+            beta = film_params[:, self.hidden_dim:]   # (B*T, hidden_dim)
             
-            h = h + cond_emb
+            # Apply FiLM: h = h * (1 + gamma) + beta
+            # Using (1 + gamma) for stability (identity initialization)
+            h = h * (1.0 + gamma) + beta
         
         # Expand time embedding to match sequence: (B*T, time_dim)
         t_emb = t_emb.unsqueeze(1).expand(-1, seq_len, -1)

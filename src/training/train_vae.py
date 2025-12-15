@@ -78,8 +78,8 @@ LATENT_DIM = 32
 # INPUT_DIM = 253 and SEQUENCE_LENGTH = 64 imported from data_utils
 
 # Loss weights (carefully tuned)
-BETA = 0.5          # KL weight (beta-VAE style, lower = more reconstruction focus)
-DYNAMICS_WEIGHT = 2.0  # Weight for dynamics-encouraging loss
+BETA = 0.01         # KL weight - VERY LOW to prevent posterior collapse
+DYNAMICS_WEIGHT = 0.0  # DISABLED - focus on reconstruction first
 
 # Dynamics loss hyperparameters
 MIN_VELOCITY = 0.15    # Minimum desired velocity magnitude (in normalized latent space)
@@ -189,10 +189,15 @@ def vae_loss_with_dynamics(recon_x, x, mu, logvar, mu_sequence, beta=0.5, dynami
     # Mean over all dimensions instead of sum (more stable scaling)
     recon_loss = F.mse_loss(recon_x, x, reduction='mean')
     
-    # 2. KL DIVERGENCE
-    # Measures how far posterior q(z|x) is from prior p(z) = N(0,1)
-    # Formula: -0.5 * sum(1 + logvar - mu^2 - exp(logvar))
-    kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+    # 2. KL DIVERGENCE with FREE BITS
+    # Free bits prevents posterior collapse by allowing some deviation from prior
+    # KL per dimension: 0.5 * (mu^2 + exp(logvar) - 1 - logvar)
+    kl_per_dim = 0.5 * (mu.pow(2) + logvar.exp() - 1 - logvar)  # (B, latent_dim)
+    
+    # Free bits: only penalize KL above threshold (increased to 1.0 for better reconstruction)
+    FREE_BITS = 1.0
+    kl_per_dim = torch.clamp(kl_per_dim, min=FREE_BITS)  # Don't penalize below threshold
+    kl_loss = kl_per_dim.mean()
     
     # 3. DYNAMICS LOSS  
     dynamics_loss, dynamics_diag = dynamics_encouraging_loss(mu_sequence)
@@ -298,9 +303,9 @@ def train_dynamics_vae(config=None):
     print(f"{'='*60}\n")
     
     # 1. Load pre-normalized dataset using shared utilities
-    # This ensures consistent normalization across VAE, GRU, and Diffusion models
+    # Use temporal split for proper evaluation of temporal dynamics
     print("Loading pre-normalized dataset...")
-    train_loader, val_loader, norm_stats = get_data_loaders(batch_size=batch_size)
+    train_loader, val_loader, norm_stats = get_data_loaders(batch_size=batch_size, temporal_split=True)
     
     # Get normalization stats as tensors
     train_mean = torch.tensor(norm_stats['mean']).to(device)
@@ -410,9 +415,10 @@ def train_dynamics_vae(config=None):
         history['mean_velocity'].append(train_metrics['velocity'])
         history['recon_loss'].append(train_metrics['recon'])
         
-        # Save best model
-        if val_metrics['loss'] < best_val_loss:
-            best_val_loss = val_metrics['loss']
+        # Save best model (use TRAINING loss because temporal split means
+        # validation is from a different time period, not same distribution)
+        if train_metrics['loss'] < best_val_loss:
+            best_val_loss = train_metrics['loss']
             torch.save(model.state_dict(), best_model_path)
             patience = 0
         else:

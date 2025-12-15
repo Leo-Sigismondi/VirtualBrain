@@ -245,26 +245,49 @@ class LatentDataset(torch.utils.data.Dataset):
 def create_train_val_split(
     total_size: int,
     val_ratio: float = 0.1,
-    seed: int = 42
+    seed: int = 42,
+    temporal_split: bool = True,
+    sequence_length: int = SEQUENCE_LENGTH
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Create train/val index split with fixed seed for reproducibility.
+    Create train/val index split with optional temporal splitting to prevent leakage.
+    
+    With stride=1, consecutive windows [0:64] and [1:65] share 63 samples.
+    Random shuffling causes data leakage between train/val sets.
     
     Args:
         total_size: Total number of samples
         val_ratio: Fraction for validation
-        seed: Random seed
+        seed: Random seed (only used if temporal_split=False)
+        temporal_split: If True, val comes from end of data to prevent leakage
+        sequence_length: Window size (used to create gap between train/val)
         
     Returns:
         Tuple of (train_indices, val_indices)
     """
-    rng = np.random.RandomState(seed)
-    indices = np.arange(total_size)
-    rng.shuffle(indices)
-    
-    val_size = int(val_ratio * total_size)
-    train_indices = indices[val_size:]
-    val_indices = indices[:val_size]
+    if temporal_split:
+        # Temporal split: last val_ratio of data is validation
+        # Add sequence_length gap to prevent any overlap
+        val_size = int(val_ratio * total_size)
+        gap = sequence_length  # Ensure no overlap between train/val windows
+        
+        train_end = total_size - val_size - gap
+        train_indices = np.arange(train_end)
+        val_indices = np.arange(total_size - val_size, total_size)
+        
+        print(f"[Data Split] Temporal split: train[0:{train_end}], val[{total_size - val_size}:{total_size}]")
+        print(f"             Gap of {gap} samples prevents window overlap")
+    else:
+        # Original random shuffle (for backward compatibility)
+        rng = np.random.RandomState(seed)
+        indices = np.arange(total_size)
+        rng.shuffle(indices)
+        
+        val_size = int(val_ratio * total_size)
+        train_indices = indices[val_size:]
+        val_indices = indices[:val_size]
+        
+        print(f"[Data Split] Random shuffle (WARNING: may cause leakage with overlapping windows)")
     
     return train_indices, val_indices
 
@@ -272,19 +295,96 @@ def create_train_val_split(
 def get_data_loaders(
     batch_size: int = 32,
     val_ratio: float = 0.1,
-    num_workers: int = 0
+    num_workers: int = 0,
+    temporal_split: bool = True
 ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader, Dict]:
     """
     Convenience function to get train/val DataLoaders and stats.
+    
+    Args:
+        batch_size: Batch size for DataLoaders
+        val_ratio: Fraction of data for validation
+        num_workers: Number of worker processes
+        temporal_split: If True, use temporal split (for sequence models).
+                       If False, use random split (for frame-level models like VAE).
     
     Returns:
         Tuple of (train_loader, val_loader, norm_stats)
     """
     data, stats = load_normalized_dataset()
-    train_idx, val_idx = create_train_val_split(len(data), val_ratio)
+    train_idx, val_idx = create_train_val_split(len(data), val_ratio, temporal_split=temporal_split)
     
     train_dataset = NormalizedDataset(data, train_idx)
     val_dataset = NormalizedDataset(data, val_idx)
+    
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers
+    )
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers
+    )
+    
+    return train_loader, val_loader, stats
+
+
+# ============================================================================
+# Conditional / Labeled Data Loading
+# ============================================================================
+
+LABELS_DATA_PATH = f"{DATA_DIR}/train_labels.npy"
+
+def load_labels(path: str = LABELS_DATA_PATH) -> np.memmap:
+    """Load labels file matching load_normalized_dataset."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Labels file not found at {path}. Run scripts/preprocess_labels_only.py")
+        
+    file_size = os.path.getsize(path)
+    # int8
+    num_samples = file_size // SEQUENCE_LENGTH
+    shape = (num_samples, SEQUENCE_LENGTH)
+    
+    return np.memmap(path, dtype='int8', mode='r', shape=shape)
+
+
+class NormalizedLabeledDataset(torch.utils.data.Dataset):
+    """
+    Dataset returning (data, labels).
+    """
+    def __init__(self, data: np.memmap, labels: np.memmap, indices: np.ndarray = None):
+        self.data = data
+        self.labels = labels
+        self.indices = indices if indices is not None else np.arange(len(data))
+    
+    def __len__(self):
+        return len(self.indices)
+    
+    def __getitem__(self, idx):
+        real_idx = self.indices[idx]
+        d = torch.from_numpy(self.data[real_idx].copy()).float()
+        l = torch.from_numpy(self.labels[real_idx].copy()).long()
+        return d, l
+
+
+def get_conditional_data_loaders(
+    batch_size: int = 32,
+    val_ratio: float = 0.1,
+    num_workers: int = 0,
+    temporal_split: bool = True
+) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader, Dict]:
+    """
+    Get DataLoaders that return (data, labels).
+    """
+    data, stats = load_normalized_dataset()
+    labels = load_labels()
+    
+    # Verify sizes match
+    if len(data) != len(labels):
+        raise ValueError(f"Data length ({len(data)}) != Labels length ({len(labels)})")
+    
+    train_idx, val_idx = create_train_val_split(len(data), val_ratio, temporal_split=temporal_split)
+    
+    train_dataset = NormalizedLabeledDataset(data, labels, train_idx)
+    val_dataset = NormalizedLabeledDataset(data, labels, val_idx)
     
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers

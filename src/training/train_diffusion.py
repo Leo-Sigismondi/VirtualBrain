@@ -91,8 +91,8 @@ def train_epoch(diffusion, vae, dataloader, optimizer, device, epoch, total_epoc
         with torch.no_grad():
             # Only get mu (don't bother computing logvar)
             latent_mu, _ = vae.encode(flat_sequences)  # (B*T, 32)
-            # Average over time for a single condition per sequence
-            condition = latent_mu.view(batch_size, seq_len, -1).mean(dim=1)  # (B, 32)
+            # Per-frame condition preserves temporal dynamics
+            condition = latent_mu.view(batch_size, seq_len, -1)  # (B, T, 32)
         
         # Free intermediate tensors
         del flat_sequences, latent_mu
@@ -133,11 +133,11 @@ def evaluate(diffusion, vae, dataloader, device, num_batches=10):
             break
         sequences = batch[0].to(device)
         
-        # Encode for condition
+        # Encode for condition - per-frame
         batch_size, seq_len, input_dim = sequences.shape
         flat_sequences = sequences.view(-1, input_dim)
         latent_mu, _ = vae.encode(flat_sequences)
-        condition = latent_mu.view(batch_size, seq_len, -1).mean(dim=1)
+        condition = latent_mu.view(batch_size, seq_len, -1)  # (B, T, 32)
         
         # Free intermediate tensors
         del flat_sequences, latent_mu
@@ -159,11 +159,16 @@ def validate_spd_samples(diffusion, device, num_samples=10, seq_len=64):
     """
     diffusion.eval()
     
-    # Use random latent vectors as conditions (simulating expected GRU output range)
-    # Normal distribution since VAE encoder produces roughly standard normal latents
-    random_conditions = torch.randn(num_samples, CONDITION_DIM, device=device)
+    # Create temporally coherent conditions (not fully random per-frame)
+    # This mimics real VAE latent trajectories which are smooth over time
+    # Start with a base latent and add small temporal perturbations
+    base_condition = torch.randn(num_samples, 1, CONDITION_DIM, device=device) * 0.3
+    temporal_noise = torch.randn(num_samples, seq_len, CONDITION_DIM, device=device) * 0.1
+    # Smooth the temporal noise with cumsum to create coherent trajectories
+    temporal_noise = temporal_noise.cumsum(dim=1) * 0.05
+    random_conditions = base_condition + temporal_noise  # (B, T, 32)
     
-    # Generate samples in tangent space with conditioning
+    # Generate samples in tangent space with per-frame conditioning
     samples = diffusion.sample_ddim(
         (num_samples, seq_len, INPUT_DIM), 
         condition=random_conditions,

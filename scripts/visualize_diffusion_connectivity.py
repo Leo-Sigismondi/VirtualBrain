@@ -136,14 +136,15 @@ def load_data(num_samples=50):
 # ============================================================================
 
 def get_vae_conditions(models, data):
-    """Encode real data with VAE to get latent conditions."""
+    """Encode real data with VAE to get per-frame latent conditions."""
     vae = models['vae']
     batch_size, seq_len, input_dim = data.shape
     
     with torch.no_grad():
         flat = data.view(-1, input_dim)
         latent_mu, _ = vae.encode(flat)
-        conditions = latent_mu.view(batch_size, seq_len, -1).mean(dim=1)
+        # Per-frame conditions preserve temporal dynamics
+        conditions = latent_mu.view(batch_size, seq_len, -1)  # (B, T, 32)
     
     return conditions
 
@@ -183,7 +184,8 @@ def get_gru_conditions(models, data, seed_steps=8):
         
         # Combine seed + predicted
         full_seq = torch.cat([latent_seq[:, :seed_steps, :], predicted], dim=1)
-        conditions = full_seq.mean(dim=1)
+        # Return per-frame conditions (B, T, 32)
+        conditions = full_seq
     
     return conditions
 

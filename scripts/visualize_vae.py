@@ -15,11 +15,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 from src.data.dataset import BCIDataset
 from torch.utils.data import DataLoader
-from src.models.vae import VAE
+from src.models.vae import ImprovedVAE
 from src.preprocessing.geometry_utils import vec_to_sym_matrix
 
 # --- CONFIG ---
-CHECKPOINT_PATH = "checkpoints/vae/vae_temporal_latent32_best.pth"  # Use best model
+CHECKPOINT_PATH = "checkpoints/vae/vae_dynamics_latent32_best.pth"  # Use best model
 LATENT_DIM = 32 # Match your training config
 INPUT_DIM = 253
 N_CHANNELS = 22  # Calculated from 253 -> 22*23/2 = 253
@@ -38,7 +38,7 @@ def visualize_reconstruction():
     
     # 2. Load Model
     print(f"Loading model from {CHECKPOINT_PATH}...")
-    model = VAE(input_dim=INPUT_DIM, latent_dim=LATENT_DIM).to(device)
+    model = ImprovedVAE(input_dim=INPUT_DIM, latent_dim=LATENT_DIM).to(device)
     model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device))
     model.eval()
     
@@ -46,13 +46,13 @@ def visualize_reconstruction():
     stats_path = f"checkpoints/vae/vae_norm_stats_latent{LATENT_DIM}.npy"
     print(f"Loading normalization stats from {stats_path}...")
     norm_stats = np.load(stats_path, allow_pickle=True).item()
-    mean = torch.tensor(norm_stats['mean']).to(device)
-    std = torch.tensor(norm_stats['std']).to(device)
+    mean = torch.tensor(norm_stats['mean']).float().to(device)
+    std = torch.tensor(norm_stats['std']).float().to(device)
 
     # 4. Get a random sample
     # Dataloader returns sequences (Batch, Seq_Len, Feat). Take first frame.
     seq_vectors, _ = next(iter(dl)) 
-    original_vec = seq_vectors[0, 0, :].to(device)  # First frame of sequence
+    original_vec = seq_vectors[0, 0, :].float().to(device)  # First frame of sequence
     
     # 5. Pass through VAE
     print("Generating reconstruction...")
@@ -61,7 +61,7 @@ def visualize_reconstruction():
         norm_vec = (original_vec - mean) / std
         
         # Forward pass
-        recon_norm, mu, _ = model(norm_vec.unsqueeze(0))  # Add batch dim
+        recon_norm, mu, _ = model(norm_vec.unsqueeze(0).float())  # Add batch dim
         
         # Denormalize output
         recon_vec = (recon_norm * std) + mean
@@ -190,7 +190,7 @@ def visualize_latent_dynamics():
     dl = DataLoader(ds, batch_size=1, shuffle=True)
     
     # 2. Load Model
-    model = VAE(input_dim=INPUT_DIM, latent_dim=LATENT_DIM).to(device)
+    model = ImprovedVAE(input_dim=INPUT_DIM, latent_dim=LATENT_DIM).to(device)
     model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device))
     model.eval()
     

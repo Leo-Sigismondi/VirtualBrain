@@ -60,13 +60,18 @@ def log_euclidean_map(spd_matrix):
     """
     Mappa dal Manifold SPD allo Spazio Tangente (Euclideo).
     Log(C) = U * log(S) * U.T
+    
+    Uses float64 for numerical stability (matches exp_euclidean_map).
     """
+    # Use float64 for numerical stability
+    spd_matrix_64 = spd_matrix.double()
+    
     # Decomposizione agli autovalori (più stabile di matrix_log generico)
     # eigh è specifico per matrici Hermitiane/Simmetriche (più veloce)
-    eigvals, eigvecs = torch.linalg.eigh(spd_matrix)
+    eigvals, eigvecs = torch.linalg.eigh(spd_matrix_64)
     
-    # Logaritmo degli autovalori (aggiungiamo epsilon per sicurezza numerica)
-    log_eigvals = torch.log(torch.clamp(eigvals, min=1e-20))
+    # Logaritmo degli autovalori (epsilon=1e-6 for float32 compatibility)
+    log_eigvals = torch.log(torch.clamp(eigvals, min=1e-6))
     
     # Ricostruzione: U * diag(log_s) * U.T
     # Usiamo matmul per gestire i batch correttamente
@@ -98,15 +103,21 @@ def ensure_spd(matrix, epsilon=1e-8):
         # Force symmetry
         matrix = (matrix + matrix.transpose(-2, -1)) / 2
         
-        # Check eigenvalues
-        eigvals = torch.linalg.eigvalsh(matrix)
-        min_eig = eigvals.min()
+        try:
+            # Check eigenvalues
+            eigvals = torch.linalg.eigvalsh(matrix)
+            min_eig = eigvals.min()
+            
+            if min_eig > 0:
+                return matrix, True
+            
+            # Add jitter to fix non-positive eigenvalues
+            jitter = abs(min_eig.item()) + epsilon
+        except torch._C._LinAlgError:
+            # Matrix is ill-conditioned - use aggressive fallback jitter
+            # This happens when matrix has repeated eigenvalues or is near-singular
+            jitter = epsilon * 100  # Use larger jitter for ill-conditioned cases
         
-        if min_eig > 0:
-            return matrix, True
-        
-        # Add jitter to fix non-positive eigenvalues
-        jitter = abs(min_eig.item()) + epsilon
         n = matrix.shape[-1]
         eye = torch.eye(n, device=matrix.device, dtype=matrix.dtype)
         matrix_fixed = matrix + eye * jitter

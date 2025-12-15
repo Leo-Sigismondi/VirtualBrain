@@ -36,12 +36,13 @@ from src.preprocessing.geometry_utils import (
 
 # Data dimensions imported from data_utils (INPUT_DIM=253, N_CHANNELS=22, SEQ_LEN=64)
 VAE_LATENT_DIM = 32
-GRU_HIDDEN_DIM = 128
+GRU_HIDDEN_DIM = 256
+GRU_NUM_LAYERS = 3
 
 # Paths
 DIFFUSION_PATH = "checkpoints/diffusion/tangent_diffusion_best.pth"
 VAE_PATH = "checkpoints/vae/vae_dynamics_latent32.pth"
-GRU_PATH = "checkpoints/gru/gru_multistep_L32_H128_2L_best.pth"
+GRU_PATH = "checkpoints/gru/gru_multistep_L32_H256_3L_best.pth"
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -81,7 +82,7 @@ def load_models(mode='vae'):
         gru = TemporalGRU(
             latent_dim=VAE_LATENT_DIM,
             hidden_dim=GRU_HIDDEN_DIM,
-            num_layers=2,
+            num_layers=GRU_NUM_LAYERS,
             dropout=0.2
         ).to(DEVICE)
         gru.load_state_dict(torch.load(GRU_PATH, map_location=DEVICE))
@@ -110,15 +111,15 @@ def load_data(num_samples=100):
 # ============================================================================
 
 def get_vae_conditions(models, data):
-    """Encode real data with VAE to get latent conditions."""
+    """Encode real data with VAE to get per-frame latent conditions."""
     vae = models['vae']
     batch_size, seq_len, input_dim = data.shape
     
     with torch.no_grad():
         flat = data.view(-1, input_dim)
         latent_mu, _ = vae.encode(flat)
-        # Average over time for sequence-level condition
-        conditions = latent_mu.view(batch_size, seq_len, -1).mean(dim=1)
+        # Per-frame conditions preserve temporal dynamics
+        conditions = latent_mu.view(batch_size, seq_len, -1)  # (B, T, 32)
     
     return conditions
 
@@ -168,8 +169,8 @@ def get_gru_conditions(models, data, seed_steps=5):
         # Combine seed + predicted (both in original latent space)
         full_seq = torch.cat([latent_seq[:, :seed_steps, :], predicted], dim=1)  # (B, seq_len, 32)
         
-        # Use predicted latent as condition (average)
-        conditions = full_seq.mean(dim=1)
+        # Return per-frame latent conditions
+        conditions = full_seq  # (B, T, 32)
     
     return conditions
 
@@ -273,13 +274,13 @@ def main():
     print(f"    Condition stats: mean={conditions.mean().item():.4f}, std={conditions.std().item():.4f}")
     
     # Generate samples
-    print(f"\nGenerating {args.num_samples} samples with diffusion...")
+    print(f"\nGenerating {args.num_samples} samples with diffusion (200 DDIM steps)...")
     with torch.no_grad():
         generated = models['diffusion'].sample_ddim(
             (args.num_samples, SEQ_LEN, INPUT_DIM),
             condition=conditions,
             device=DEVICE,
-            steps=50
+            steps=200  # More steps = better quality (was 50)
         )
     print("[OK] Samples generated")
     
@@ -322,7 +323,15 @@ def main():
 
 
 def evaluate_riemannian_fidelity(real_samples, gen_samples, norm_stats):
-    """Calculate mean Riemannian distance between real and generated samples."""
+    """
+    Calculate Riemannian distances with meaningful baselines.
+    
+    Computes:
+    1. Real vs Generated distance (how close are generated samples to real?)
+    2. Real vs Real distance (baseline: how different are real samples from each other?)
+    
+    If gen_distance ≈ real_real_distance, the model is generating realistic samples.
+    """
     device = gen_samples.device
     
     # Convert real_samples if needed
@@ -338,7 +347,8 @@ def evaluate_riemannian_fidelity(real_samples, gen_samples, norm_stats):
     
     # Process in chunks
     batch_size = 16
-    total_dist = 0
+    total_dist_gen = 0
+    total_dist_real = 0
     num_batches = 0
     
     with torch.no_grad():
@@ -350,13 +360,33 @@ def evaluate_riemannian_fidelity(real_samples, gen_samples, norm_stats):
             spd_real = exp_euclidean_map(vec_to_sym_matrix(r_batch, N_CHANNELS))
             spd_gen = exp_euclidean_map(vec_to_sym_matrix(g_batch, N_CHANNELS))
             
-            # Log-Euclidean distance
-            dists = riemannian_distance(spd_real, spd_gen, metric='affine_invariant')
-            total_dist += dists.mean().item()
+            # Real vs Generated distance
+            dists_gen = riemannian_distance(spd_real, spd_gen, metric='affine_invariant')
+            total_dist_gen += dists_gen.mean().item()
+            
+            # Real vs Real baseline (compare to shuffled real samples)
+            # Shuffle indices to compare different real samples
+            perm = torch.randperm(spd_real.shape[0])
+            spd_real_shuffled = spd_real[perm]
+            dists_real = riemannian_distance(spd_real, spd_real_shuffled, metric='affine_invariant')
+            total_dist_real += dists_real.mean().item()
+            
             num_batches += 1
             
-    avg_dist = total_dist / num_batches if num_batches > 0 else 0
-    print(f"Mean Riemannian Distance (Affine Invariant): {avg_dist:.4f}")
+    avg_dist_gen = total_dist_gen / num_batches if num_batches > 0 else 0
+    avg_dist_real = total_dist_real / num_batches if num_batches > 0 else 0
+    
+    print(f"\n📐 Riemannian Fidelity (Affine Invariant):")
+    print(f"   Real↔Real baseline:     {avg_dist_real:.4f}")
+    print(f"   Real↔Generated:         {avg_dist_gen:.4f}")
+    
+    ratio = avg_dist_gen / (avg_dist_real + 1e-8)
+    if ratio < 1.5:
+        print(f"   Ratio (Gen/Real):        {ratio:.2f}x  ✅ Good!")
+    elif ratio < 3.0:
+        print(f"   Ratio (Gen/Real):        {ratio:.2f}x  ⚠️ Moderate")
+    else:
+        print(f"   Ratio (Gen/Real):        {ratio:.2f}x  ❌ Poor")
 
 
 if __name__ == "__main__":

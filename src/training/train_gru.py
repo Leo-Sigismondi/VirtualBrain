@@ -56,8 +56,8 @@ BATCH_SIZE = 256
 EPOCHS = 200
 LEARNING_RATE = 5e-4
 LATENT_DIM = 32
-HIDDEN_DIM = 128
-NUM_LAYERS = 2
+HIDDEN_DIM = 256  # Increased from 128 for more capacity
+NUM_LAYERS = 3    # Increased from 2 for deeper temporal modeling
 DROPOUT = 0.2
 # INPUT_DIM = 253 and SEQUENCE_LENGTH = 64 imported from data_utils
 
@@ -78,8 +78,8 @@ VAE_PATH = "checkpoints/vae/vae_dynamics_latent32_best.pth"
 VAE_STATS_PATH = "checkpoints/vae/vae_norm_stats_dynamics_latent32.npy"
 
 SAVE_DIR = "checkpoints/gru"
-SAVE_PATH = f"{SAVE_DIR}/gru_multistep_L32_H{HIDDEN_DIM}_2L.pth"
-BEST_MODEL_PATH = f"{SAVE_DIR}/gru_multistep_L32_H{HIDDEN_DIM}_2L_best.pth"
+SAVE_PATH = f"{SAVE_DIR}/gru_multistep_L32_H{HIDDEN_DIM}_{NUM_LAYERS}L.pth"
+BEST_MODEL_PATH = f"{SAVE_DIR}/gru_multistep_L32_H{HIDDEN_DIM}_{NUM_LAYERS}L_best.pth"
 
 
 
@@ -186,6 +186,58 @@ def compute_diversity_loss(predictions, targets):
     return diversity_loss
 
 
+def compute_temporal_variance_loss(predictions, targets):
+    """
+    Force predictions to match the TEMPORAL VARIANCE of ground truth.
+    
+    WHY THIS HELPS:
+    - GRU tends to predict "safe" low-variance outputs (flat dynamics)
+    - This loss penalizes when predictions have less variation over time
+    - Encourages the model to capture the full dynamic range
+    
+    Args:
+        predictions: (Batch, Seq, Latent)
+        targets: (Batch, Seq, Latent)
+    """
+    # Variance over time (dim=1) for each sample, then average
+    pred_temporal_var = predictions.var(dim=1).mean()  # (B, D) -> scalar
+    target_temporal_var = targets.var(dim=1).mean()
+    
+    # Penalize when predictions have less temporal variance than targets
+    var_ratio = pred_temporal_var / (target_temporal_var + 1e-8)
+    temporal_var_loss = torch.relu(1.0 - var_ratio)
+    
+    return temporal_var_loss
+
+
+def compute_velocity_loss(predictions, targets):
+    """
+    Match velocity (frame-to-frame changes) between predictions and targets.
+    
+    WHY THIS HELPS:
+    - Velocities capture the dynamics of the sequence
+    - If prediction velocities are too small, the output looks flat
+    - MSE on velocities + variance matching ensures dynamic predictions
+    
+    Args:
+        predictions: (Batch, Seq, Latent)
+        targets: (Batch, Seq, Latent)
+    """
+    # Compute velocities (differences between consecutive frames)
+    pred_velocity = predictions[:, 1:, :] - predictions[:, :-1, :]
+    target_velocity = targets[:, 1:, :] - targets[:, :-1, :]
+    
+    # L2 loss on velocities (match the direction and magnitude of changes)
+    velocity_mse = F.mse_loss(pred_velocity, target_velocity)
+    
+    # Also match velocity variance (ensure similar "energy" in dynamics)
+    pred_vel_var = pred_velocity.var()
+    target_vel_var = target_velocity.var()
+    vel_var_loss = torch.relu(1.0 - pred_vel_var / (target_vel_var + 1e-8))
+    
+    return velocity_mse + vel_var_loss
+
+
 def train_epoch_multistep(model, inputs, targets, optimizer, device, epoch, total_epochs):
     """
     Train for one epoch with multi-step loss and scheduled sampling.
@@ -262,7 +314,10 @@ def train_epoch_multistep(model, inputs, targets, optimizer, device, epoch, tota
         # Batch diversity loss (prevents model from ignoring input)
         diversity_loss = compute_diversity_loss(pred_sequence, target_portion)
         
-        # Combined loss with diversity regularization
+        # Combined loss (original formula without temporal variance losses)
+        # - mse_loss: reconstruction accuracy
+        # - dir_loss: direction correctness (0.5 weight)
+        # - diversity_loss: batch diversity (2.0 weight)
         loss = mse_loss + 0.5 * dir_loss + 2.0 * diversity_loss
         
         loss.backward()
