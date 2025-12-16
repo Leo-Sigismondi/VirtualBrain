@@ -8,8 +8,14 @@ Run this ONCE before training:
     python scripts/preprocess_normalize.py
 
 Output:
-    - data/processed/train_normalized.pt - normalized vectorized data
+    - data/processed/train_normalized.npy - normalized vectorized data (memmap)
+    - data/processed/train_labels_windows.npy - per-window activity labels
     - data/processed/normalization_stats.npy - mean/std for denormalization
+
+Label Strategy (Primary Activity):
+    - If window contains any activity (class 1-4), use that activity class
+    - If window contains multiple activities, use majority among activities
+    - If window contains only rest (class 0), label as 0
 """
 
 import os
@@ -25,7 +31,51 @@ from src.data.dataset import BCIDataset
 
 # Paths
 STATS_PATH = "data/processed/normalization_stats.npy"
-NORMALIZED_DATA_PATH = "data/processed/train_normalized.pt"
+NORMALIZED_DATA_PATH = "data/processed/train_normalized.npy"
+LABELS_PATH = "data/processed/train_labels_windows.npy"
+
+# Minimum activity steps to consider a window as having that activity
+# Activity segments are ~15-16 steps, so 8 means at least half an activity period
+MIN_ACTIVITY_STEPS = 8
+
+
+def get_primary_activity_label(label_sequence, min_activity_steps=MIN_ACTIVITY_STEPS):
+    """
+    Get the primary activity label for a window.
+    
+    Strategy:
+    - If any activity (class 1-4) has >= min_activity_steps, use that activity
+    - If multiple activities meet threshold, use the one with most steps
+    - If no activity meets threshold, label as rest (0)
+    
+    Args:
+        label_sequence: numpy array of shape (seq_len,) with class labels
+        min_activity_steps: minimum steps of activity required to label as that class
+        
+    Returns:
+        int: Primary activity label for this window
+    """
+    # Count steps per class
+    unique_labels, counts = np.unique(label_sequence, return_counts=True)
+    label_counts = dict(zip(unique_labels, counts))
+    
+    # Find activity classes (1-4) that meet the threshold
+    valid_activities = []
+    for label in range(1, 5):  # Classes 1-4
+        count = label_counts.get(label, 0)
+        if count >= min_activity_steps:
+            valid_activities.append((label, count))
+    
+    if len(valid_activities) == 0:
+        # No activity meets threshold - label as rest
+        return 0
+    elif len(valid_activities) == 1:
+        # Single activity meets threshold
+        return valid_activities[0][0]
+    else:
+        # Multiple activities meet threshold - use the one with most steps
+        valid_activities.sort(key=lambda x: x[1], reverse=True)
+        return valid_activities[0][0]
 
 
 def main():
@@ -71,26 +121,27 @@ def main():
         print(f"Computed and saved stats - Mean: {global_mean:.6f}, Std: {global_std:.6f}")
 
     # Create memmap for validation/verification of size
-    print("\nPreparing to save normalized data...")
+    print("\nPreparing to save normalized data and labels...")
     dataset = BCIDataset("data/processed/train", sequence_length=64)
     N_SAMPLES = len(dataset)
     SHAPE = (N_SAMPLES, 64, 253)
     
-    # Use .npy format but write via memmap
-    # First create the file with header by saving a dummy array then reopening as memmap
-    normalized_path_npy = "data/processed/train_normalized.npy"
-    
     # We'll use a streaming write approach with memmap
-    print(f"Output file: {normalized_path_npy}")
+    print(f"Output file: {NORMALIZED_DATA_PATH}")
+    print(f"Labels file: {LABELS_PATH}")
     print(f"Total shape: {SHAPE}")
     
-    fp = np.memmap(normalized_path_npy, dtype='float32', mode='w+', shape=SHAPE)
+    fp = np.memmap(NORMALIZED_DATA_PATH, dtype='float32', mode='w+', shape=SHAPE)
+    
+    # Also collect labels
+    all_labels = []
     
     loader = DataLoader(dataset, batch_size=512, shuffle=False, num_workers=0)
     
     idx = 0
     for batch in tqdm(loader, desc="Normalizing & Saving"):
         data = batch[0].numpy()  # (B, T, D)
+        labels = batch[1].numpy()  # (B, T) - per-step labels
         B = data.shape[0]
         
         # Normalize
@@ -100,6 +151,11 @@ def main():
         fp[idx : idx + B] = normalized_batch.astype(np.float32)
         idx += B
         
+        # Extract primary activity label for each window
+        for window_labels in labels:
+            primary_label = get_primary_activity_label(window_labels)
+            all_labels.append(primary_label)
+        
         # Flush periodically
         if idx % 5000 == 0:
             fp.flush()
@@ -107,8 +163,23 @@ def main():
     fp.flush()
     del fp  # Close memmap
     
+    # Save labels
+    all_labels = np.array(all_labels, dtype=np.int64)
+    np.save(LABELS_PATH, all_labels)
+    
+    # Print label distribution
+    print("\n" + "-"*40)
+    print("Window Label Distribution:")
+    unique, counts = np.unique(all_labels, return_counts=True)
+    for u, c in zip(unique, counts):
+        pct = 100 * c / len(all_labels)
+        print(f"  Class {u}: {c:6d} ({pct:5.1f}%)")
+    print("-"*40)
+    
     print("\n" + "="*60)
     print("✓ Pre-normalization Complete!")
+    print(f"  Data saved to: {NORMALIZED_DATA_PATH}")
+    print(f"  Labels saved to: {LABELS_PATH}")
     print("="*60 + "\n")
 
 

@@ -132,105 +132,31 @@ class TemporalGRU(nn.Module):
         return torch.zeros(self.num_layers, batch_size, self.hidden_dim).to(device)
 
 
-class ConditionalGRU(nn.Module):
-    """
-    Class-Conditional GRU for Latent Dynamics.
-    Allows predicting trajectories specific to a class (e.g., Left Hand vs Right Hand).
+# Example usage and testing
+if __name__ == "__main__":
+    # Test the model
+    batch_size = 32
+    seq_len = 4
+    latent_dim = 16
     
-    Architecture:
-    - Embedding: Maps class ID -> Vector
-    - Input: Concat[Latent, Embedding] -> GRU
-    - Head: GRU_Out -> Delta
-    """
-    def __init__(self, num_classes=5, class_emb_dim=8, latent_dim=16, hidden_dim=64, num_layers=2, dropout=0.1):
-        super(ConditionalGRU, self).__init__()
-        
-        self.latent_dim = latent_dim
-        self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
-        self.class_emb_dim = class_emb_dim
-        
-        # Class Embedding
-        self.embedding = nn.Embedding(num_classes, class_emb_dim)
-        
-        # GRU Layer
-        input_size = latent_dim + class_emb_dim
-        self.gru = nn.GRU(
-            input_size=input_size,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0
-        )
-        
-        # Output Head
-        self.head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, latent_dim)
-        )
-
-    def forward(self, z_sequence, labels, hidden=None):
-        """
-        Args:
-            z_sequence: (Batch, Seq_Len, Latent)
-            labels: (Batch, Seq_Len) - Integer class labels per timestep
-            hidden: Initial hidden state
-        """
-        B, T, D = z_sequence.shape
-        
-        # Embed labels
-        # labels: (B, T) -> (B, T, Emb)
-        emb = self.embedding(labels)
-        
-        # Concatenate inputs
-        # (B, T, Latent) + (B, T, Emb) -> (B, T, Latent + Emb)
-        rnn_input = torch.cat([z_sequence, emb], dim=-1)
-        
-        # GRU Pass
-        gru_out, hidden = self.gru(rnn_input, hidden)
-        
-        # Predict Delta
-        delta = self.head(gru_out)
-        
-        return delta, hidden
-
-    def predict_next(self, z_current, label, hidden=None):
-        """
-        Symbolic 1-step prediction for generation.
-        label: (Batch, 1) or (Batch,)
-        """
-        if label.dim() == 1:
-            label = label.unsqueeze(1) # (B, 1)
-            
-        emb = self.embedding(label) # (B, 1, Emb)
-        
-        rnn_input = torch.cat([z_current, emb], dim=-1)
-        
-        gru_out, hidden = self.gru(rnn_input, hidden)
-        delta = self.head(gru_out)
-        
-        z_next = z_current + delta
-        return z_next, hidden
-
-    def generate_sequence(self, z_start, class_idx, num_steps, hidden=None):
-        """
-        Generate sequence for a specific class.
-        class_idx: Integer or (Batch,) tensor
-        """
-        B = z_start.shape[0]
-        if isinstance(class_idx, int):
-            label = torch.full((B, 1), class_idx, device=z_start.device, dtype=torch.long)
-        else:
-            label = class_idx.view(B, 1)
-            
-        predictions = []
-        z_current = z_start
-        
-        for _ in range(num_steps):
-            z_next, hidden = self.predict_next(z_current, label, hidden)
-            predictions.append(z_next)
-            z_current = z_next
-            
-        return torch.cat(predictions, dim=1)
+    # Create model
+    model = TemporalGRU(latent_dim=latent_dim, hidden_dim=64, num_layers=2)
+    
+    # Create dummy input (batch of latent sequences)
+    z_sequence = torch.randn(batch_size, seq_len, latent_dim)
+    
+    # Forward pass
+    delta, hidden = model(z_sequence)
+    
+    print(f"Input shape: {z_sequence.shape}")
+    print(f"Delta shape: {delta.shape}")
+    print(f"Hidden shape: {hidden.shape}")
+    
+    # Test autoregressive generation
+    z_start = torch.randn(batch_size, 1, latent_dim)
+    generated = model.generate_sequence(z_start, num_steps=10)
+    print(f"Generated sequence shape: {generated.shape}")
+    
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"\nTotal parameters: {total_params:,}")

@@ -23,11 +23,13 @@ from typing import Dict, Tuple, Optional
 DATA_DIR = "data/processed"
 NORMALIZED_DATA_PATH = f"{DATA_DIR}/train_normalized.npy"
 NORM_STATS_PATH = f"{DATA_DIR}/normalization_stats.npy"
+LABELS_PATH = f"{DATA_DIR}/train_labels_windows.npy"
 
 # Data dimensions
 INPUT_DIM = 253  # Vectorized lower triangle of 22x22 symmetric matrix
 N_CHANNELS = 22
 SEQUENCE_LENGTH = 64
+NUM_CLASSES = 5  # 0=rest, 1-4=motor imagery classes
 
 
 # ============================================================================
@@ -90,6 +92,57 @@ def load_normalized_dataset(
         return data, stats
     
     return data
+
+
+def load_window_labels(path: str = LABELS_PATH) -> np.ndarray:
+    """
+    Load per-window activity labels.
+    
+    Labels use "primary activity" strategy:
+    - If window has >= 8 steps of an activity, labeled as that activity
+    - Otherwise labeled as rest (0)
+    
+    Args:
+        path: Path to labels .npy file
+        
+    Returns:
+        numpy array of shape (num_samples,) with int64 labels
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Window labels not found at {path}. "
+            "Run scripts/preprocess_normalize.py first."
+        )
+    
+    return np.load(path)
+
+
+def load_normalized_dataset_with_labels(
+    data_path: str = NORMALIZED_DATA_PATH,
+    labels_path: str = LABELS_PATH,
+    return_stats: bool = True
+) -> Tuple[np.memmap, np.ndarray, Optional[Dict[str, float]]]:
+    """
+    Load normalized dataset along with window labels.
+    
+    Args:
+        data_path: Path to normalized data
+        labels_path: Path to window labels
+        return_stats: Whether to also return normalization stats
+        
+    Returns:
+        Tuple of (data, labels, stats) if return_stats=True
+        Tuple of (data, labels) otherwise
+    """
+    data, stats = load_normalized_dataset(data_path, return_stats=True)
+    labels = load_window_labels(labels_path)
+    
+    assert len(data) == len(labels), \
+        f"Data/label mismatch: {len(data)} samples vs {len(labels)} labels"
+    
+    if return_stats:
+        return data, labels, stats
+    return data, labels
 
 
 def denormalize(data: torch.Tensor, stats: Dict[str, float]) -> torch.Tensor:
@@ -238,6 +291,33 @@ class LatentDataset(torch.utils.data.Dataset):
         return (self.data[real_idx],)
 
 
+class LabeledLatentDataset(torch.utils.data.Dataset):
+    """
+    Dataset of pre-encoded VAE latent sequences WITH class labels.
+    
+    For training conditional GRU that generates class-specific trajectories.
+    """
+    def __init__(
+        self, 
+        latent_data: torch.Tensor,
+        labels: np.ndarray,
+        indices: np.ndarray = None
+    ):
+        self.data = latent_data
+        self.labels = torch.from_numpy(labels).long() if isinstance(labels, np.ndarray) else labels
+        self.indices = indices if indices is not None else np.arange(len(latent_data))
+        
+        assert len(self.data) == len(self.labels), \
+            f"Data/label size mismatch: {len(self.data)} vs {len(self.labels)}"
+    
+    def __len__(self):
+        return len(self.indices)
+    
+    def __getitem__(self, idx):
+        real_idx = self.indices[idx]
+        return self.data[real_idx], self.labels[real_idx]
+
+
 # ============================================================================
 # Helper Functions
 # ============================================================================
@@ -316,75 +396,6 @@ def get_data_loaders(
     
     train_dataset = NormalizedDataset(data, train_idx)
     val_dataset = NormalizedDataset(data, val_idx)
-    
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers
-    )
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers
-    )
-    
-    return train_loader, val_loader, stats
-
-
-# ============================================================================
-# Conditional / Labeled Data Loading
-# ============================================================================
-
-LABELS_DATA_PATH = f"{DATA_DIR}/train_labels.npy"
-
-def load_labels(path: str = LABELS_DATA_PATH) -> np.memmap:
-    """Load labels file matching load_normalized_dataset."""
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Labels file not found at {path}. Run scripts/preprocess_labels_only.py")
-        
-    file_size = os.path.getsize(path)
-    # int8
-    num_samples = file_size // SEQUENCE_LENGTH
-    shape = (num_samples, SEQUENCE_LENGTH)
-    
-    return np.memmap(path, dtype='int8', mode='r', shape=shape)
-
-
-class NormalizedLabeledDataset(torch.utils.data.Dataset):
-    """
-    Dataset returning (data, labels).
-    """
-    def __init__(self, data: np.memmap, labels: np.memmap, indices: np.ndarray = None):
-        self.data = data
-        self.labels = labels
-        self.indices = indices if indices is not None else np.arange(len(data))
-    
-    def __len__(self):
-        return len(self.indices)
-    
-    def __getitem__(self, idx):
-        real_idx = self.indices[idx]
-        d = torch.from_numpy(self.data[real_idx].copy()).float()
-        l = torch.from_numpy(self.labels[real_idx].copy()).long()
-        return d, l
-
-
-def get_conditional_data_loaders(
-    batch_size: int = 32,
-    val_ratio: float = 0.1,
-    num_workers: int = 0,
-    temporal_split: bool = True
-) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader, Dict]:
-    """
-    Get DataLoaders that return (data, labels).
-    """
-    data, stats = load_normalized_dataset()
-    labels = load_labels()
-    
-    # Verify sizes match
-    if len(data) != len(labels):
-        raise ValueError(f"Data length ({len(data)}) != Labels length ({len(labels)})")
-    
-    train_idx, val_idx = create_train_val_split(len(data), val_ratio, temporal_split=temporal_split)
-    
-    train_dataset = NormalizedLabeledDataset(data, labels, train_idx)
-    val_dataset = NormalizedLabeledDataset(data, labels, val_idx)
     
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers
